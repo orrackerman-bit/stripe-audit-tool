@@ -12,11 +12,12 @@ st.markdown("""
     .block-container { padding-top: 1.5rem; max-width: 1400px; }
     .stat-num { font-size: 2rem; font-weight: 700; margin-bottom: 0.25rem; }
     .stat-label { font-size: 0.8rem; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em; }
-    .num-active { color: #16a34a; }
+    .num-active  { color: #16a34a; }
     .num-pastdue { color: #d97706; }
     .num-cancels { color: #7c3aed; }
-    .num-canceled { color: #dc2626; }
+    .num-canceled{ color: #dc2626; }
     div[data-testid="stMetric"] { background: #f9fafb; border-radius: 10px; padding: 0.75rem; }
+    div[data-testid="stHorizontalBlock"] button[kind="secondary"] { font-size: 12px !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -101,45 +102,64 @@ def fetch_sf_accounts(access_token, instance_url):
     return sf_query(soql, access_token, instance_url)
 
 # --- Stripe ---
-def stripe_get(endpoint, api_key, params=None):
+def stripe_request(endpoint, api_key, params=None):
     try:
-        r = requests.get(f"https://api.stripe.com/v1/{endpoint}",
+        r = requests.get(
+            f"https://api.stripe.com/v1/{endpoint}",
             params=params or {},
-            headers={"Authorization": f"Bearer {api_key}"}, timeout=10)
-        if r.status_code != 200: return None
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10
+        )
+        if r.status_code != 200:
+            return None
         return r.json()
-    except: return None
+    except:
+        return None
 
-def stripe_search(query_str, api_key):
-    d = stripe_get("customers/search", api_key,
-        {"query": query_str, "limit": 1, "expand[]": "data.subscriptions"})
-    if d and d.get("data"): return d["data"][0]
+def stripe_search_customer(query_str, api_key):
+    d = stripe_request("customers/search", api_key, {
+        "query": query_str,
+        "limit": 1,
+        "expand[]": "data.subscriptions"
+    })
+    if d and d.get("data"):
+        return d["data"][0]
+    return None
+
+def stripe_list_customer_by_email(email, api_key):
+    """Use list endpoint as fallback — more reliable than search for email."""
+    d = stripe_request("customers", api_key, {
+        "email": email,
+        "limit": 1,
+        "expand[]": "data.subscriptions"
+    })
+    if d and d.get("data"):
+        return d["data"][0]
     return None
 
 def get_stripe_customer(sf_id, name, email, key_us, key_intl):
-    """Match by Salesforce ID in metadata first, then name, then email."""
     for api_key, source in [(key_us, "US"), (key_intl, "Intl")]:
         if not api_key or len(api_key) < 10:
             continue
-        # 1. Match by Salesforce ID in metadata
-        c = stripe_search(f"metadata['salesforce_id']:'{sf_id}'", api_key)
+        # 1. Metadata: salesforce_id
+        c = stripe_search_customer(f"metadata['salesforce_id']:'{sf_id}'", api_key)
         if c: return c, source, "sf_id"
-        # Also try our-account-id metadata
-        c = stripe_search(f"metadata['our-account-id']:'{sf_id}'", api_key)
-        if c: return c, source, "sf_id"
+        # 2. Metadata: our-account-id
+        c = stripe_search_customer(f"metadata['our-account-id']:'{sf_id}'", api_key)
+        if c: return c, source, "sf_id(alt)"
 
-    # 2. Fallback: name search across both accounts
+    # 3. Name search both accounts
     for api_key, source in [(key_us, "US"), (key_intl, "Intl")]:
         if not api_key or len(api_key) < 10: continue
         if name:
-            c = stripe_search(f"name:'{name}'", api_key)
+            c = stripe_search_customer(f"name:'{name}'", api_key)
             if c: return c, source, "name"
 
-    # 3. Fallback: email search
+    # 4. Email — use list endpoint (exact match, more reliable)
     for api_key, source in [(key_us, "US"), (key_intl, "Intl")]:
         if not api_key or len(api_key) < 10: continue
         if email and "@" in email:
-            c = stripe_search(f"email:'{email}'", api_key)
+            c = stripe_list_customer_by_email(email, api_key)
             if c: return c, source, "email"
 
     return None, None, None
@@ -148,6 +168,7 @@ def get_stripe_status(customer):
     if not customer: return "not_found", None
     subs = customer.get("subscriptions", {}).get("data", [])
     if not subs: return "no_subscription", None
+    # Active + scheduled to cancel
     for s in subs:
         if s.get("status") == "active" and s.get("cancel_at_period_end"):
             ts = s.get("cancel_at")
@@ -190,7 +211,7 @@ def get_stripe_plans(customer):
         status = s.get("status", "")
         cancel_at = s.get("cancel_at")
         cancel_date = datetime.fromtimestamp(cancel_at, tz=timezone.utc).strftime("%b %d, %Y") if cancel_at else None
-        display_status = f"Cancels {cancel_date}" if (status == "active" and cancel_date) else status.replace("_"," ").title()
+        display_status = f"Cancels {cancel_date}" if (status == "active" and cancel_date) else status.replace("_", " ").title()
         for item in s.get("items", {}).get("data", []):
             price = item.get("price", {})
             product = price.get("nickname") or price.get("id", "")
@@ -199,12 +220,12 @@ def get_stripe_plans(customer):
             interval = price.get("recurring", {}).get("interval", "month")
             total = round(amount * qty, 2)
             plans.append({
-                "Product":    product,
-                "Price":      f"${amount:,.2f}",
-                "Qty":        qty,
-                "Total/mo":   f"${total:,.2f}",
-                "Frequency":  interval.capitalize(),
-                "Status":     display_status,
+                "Product":   product,
+                "Price":     f"${amount:,.2f}",
+                "Qty":       qty,
+                "Total/mo":  f"${total:,.2f}",
+                "Frequency": interval.capitalize(),
+                "Status":    display_status,
             })
     return plans
 
@@ -214,9 +235,9 @@ if auth_code and "sf_access_token" not in st.session_state:
     with st.spinner("Logging in with Salesforce..."):
         try:
             td = exchange_code(auth_code)
-            st.session_state["sf_access_token"]  = td["access_token"]
-            st.session_state["sf_refresh_token"]  = td.get("refresh_token", "")
-            st.session_state["sf_instance_url"]   = td["instance_url"]
+            st.session_state["sf_access_token"] = td["access_token"]
+            st.session_state["sf_refresh_token"] = td.get("refresh_token", "")
+            st.session_state["sf_instance_url"]  = td["instance_url"]
             st.query_params.clear()
             st.rerun()
         except Exception as e:
@@ -265,15 +286,20 @@ with col2:
     search = st.text_input("🔍 Search accounts", placeholder="Type account name...")
 with col3:
     st.markdown("<br>", unsafe_allow_html=True)
-    c3a, c3b = st.columns(2)
+    c3a, c3b, c3c = st.columns(3)
     with c3a:
-        if st.button("↺ Refresh"):
+        if st.button("🏠", help="Home"):
+            st.session_state.pop("selected_account", None)
+            st.session_state["status_filter"] = None
+            st.rerun()
+    with c3b:
+        if st.button("🔄", help="Refresh data"):
             fetch_sf_accounts.clear()
             for k in ["data_loaded","sf_raw","all_results"]:
                 st.session_state.pop(k, None)
             st.rerun()
-    with c3b:
-        if st.button("Logout"):
+    with c3c:
+        if st.button("↩️", help="Logout"):
             for k in ["sf_access_token","sf_refresh_token","sf_instance_url",
                       "data_loaded","sf_raw","all_results","status_filter","selected_account"]:
                 st.session_state.pop(k, None)
@@ -292,16 +318,17 @@ if "all_results" not in st.session_state:
         country = r.get("BillingCountry", "") or ""
         sf_id   = r.get("Id", "")
 
-        plans_data = r.get("Plans__r") or {}
+        # SF Plans
+        plans_data = r.get("Contract_Assets__r") or {}
         plans = []
         for p in (plans_data.get("records") or []):
             plans.append({
-                "Plan Name":  p.get("Name", ""),
-                "Active":     "✓" if p.get("Active__c") else "—",
-                "Units":      p.get("Unit__c", "") or "",
-                "ARR":        p.get("ARR__c", 0) or 0,
-                "Start Date": p.get("Start_Date__c", "") or "",
-                "End Date":   p.get("End_Date__c", "") or "",
+                "Plan Name":            p.get("Name", ""),
+                "Active":               "✓" if p.get("Active__c") else "—",
+                "Units":                p.get("Unit__c", "") or "",
+                "ARR":                  p.get("ARR__c", 0) or 0,
+                "Start Date":           p.get("Start_Date__c", "") or "",
+                "End Date":             p.get("End_Date__c", "") or "",
                 "Log Retention (days)": p.get("Logging_Retention_Days__c", "") or "",
             })
 
@@ -314,7 +341,7 @@ if "all_results" not in st.session_state:
         mrr = get_mrr(customer)
         stripe_plans = get_stripe_plans(customer)
 
-        if stripe_status == "active":           status_label = "Active"
+        if stripe_status == "active":            status_label = "Active"
         elif stripe_status == "past_due":        status_label = "Past due"
         elif stripe_status == "cancels_on":      status_label = f"Cancels {status_detail}"
         elif stripe_status == "canceled":        status_label = f"Canceled ({status_detail})" if status_detail else "Canceled"
@@ -323,19 +350,19 @@ if "all_results" not in st.session_state:
         else:                                    status_label = stripe_status.replace("_"," ").title()
 
         results.append({
-            "sf_id":         sf_id,
-            "Account Name":  name,
-            "Country":       country,
-            "Billing Email": email,
-            "SF ARR":        arr,
-            "Stripe MRR":    mrr,
-            "Stripe ARR":    round(mrr * 12, 2),
-            "Stripe Status": stripe_status,
-            "Status Label":  status_label,
-            "Matched By":    matched_by or "—",
-            "Stripe Source": stripe_source or "—",
-            "sf_plans":      plans,
-            "stripe_plans":  stripe_plans,
+            "sf_id":            sf_id,
+            "Account Name":     name,
+            "Country":          country,
+            "Billing Email":    email,
+            "SF ARR":           arr,
+            "Stripe MRR":       mrr,
+            "Stripe ARR":       round(mrr * 12, 2),
+            "Stripe Status":    stripe_status,
+            "Status Label":     status_label,
+            "Matched By":       matched_by or "—",
+            "Stripe Account":   stripe_source or "—",
+            "sf_plans":         plans,
+            "stripe_plans":     stripe_plans,
         })
         time.sleep(0.05)
 
@@ -346,11 +373,9 @@ if "all_results" not in st.session_state:
 results = st.session_state["all_results"]
 df = pd.DataFrame(results)
 
-# --- Search filter ---
 if search:
     df = df[df["Account Name"].str.contains(search, case=False, na=False)]
 
-# --- Status counts ---
 n_active   = len(df[df["Stripe Status"] == "active"])
 n_pastdue  = len(df[df["Stripe Status"] == "past_due"])
 n_cancels  = len(df[df["Stripe Status"] == "cancels_on"])
@@ -401,10 +426,10 @@ if "selected_account" in st.session_state:
     }
     bg_c, txt_c = status_colors.get(acct["Stripe Status"], ("#f3f4f6","#374151"))
 
-    col1, col2 = st.columns([3,1])
+    col1, col2 = st.columns([3, 1])
     with col1:
         st.markdown(f"## {acct['Account Name']}")
-        st.caption(f"{acct['Billing Email']} · {acct['Country']} · Matched by: {acct['Matched By']} · {acct['Stripe Source']} account")
+        st.caption(f"{acct['Billing Email']} · {acct['Country']} · Matched by: {acct['Matched By']} · {acct['Stripe Account']} Stripe account")
     with col2:
         st.markdown(f"<br><span style='background:{bg_c}; color:{txt_c}; padding:6px 16px; border-radius:20px; font-size:13px; font-weight:600;'>{acct['Status Label']}</span>", unsafe_allow_html=True)
 
@@ -444,21 +469,24 @@ else:
         display_df = df.copy()
         st.markdown(f"### Account List View ({len(display_df)} accounts)")
 
-    status_icons = {"active":"✅","past_due":"⚠️","cancels_on":"🟣","canceled":"🔴","not_found":"⬜","no_subscription":"⬜"}
+    status_icons = {
+        "active":"✅","past_due":"⚠️","cancels_on":"🟣",
+        "canceled":"🔴","not_found":"⬜","no_subscription":"⬜"
+    }
 
-    # Column headers
-    h1,h2,h3,h4,h5,h6,h7 = st.columns([2.5,1,2,1.2,1.2,1.5,0.7])
+    # Headers
+    h1,h2,h3,h4,h5,h6,h7 = st.columns([2.5,1,2,1.2,1.2,1.8,0.8])
     h1.markdown("**Account Name**")
     h2.markdown("**Country**")
     h3.markdown("**Billing Email**")
     h4.markdown("**SF ARR**")
     h5.markdown("**Stripe ARR**")
     h6.markdown("**Stripe Status**")
-    h7.markdown("**Acct**")
+    h7.markdown("**Stripe Acct**")
     st.divider()
 
     for _, row in display_df.iterrows():
-        c1,c2,c3,c4,c5,c6,c7 = st.columns([2.5,1,2,1.2,1.2,1.5,0.7])
+        c1,c2,c3,c4,c5,c6,c7 = st.columns([2.5,1,2,1.2,1.2,1.8,0.8])
         with c1:
             if st.button(row["Account Name"], key=f"acct_{row['sf_id']}", use_container_width=True):
                 st.session_state["selected_account"] = row.to_dict()
@@ -469,7 +497,7 @@ else:
         c5.write(f"${row['Stripe ARR']:,.0f}" if row["Stripe ARR"] else "—")
         icon = status_icons.get(row["Stripe Status"], "⬜")
         c6.write(f"{icon} {row['Status Label']}")
-        c7.write(row["Stripe Source"])
+        c7.write(row["Stripe Account"])
 
     st.divider()
     csv = display_df.drop(columns=["sf_plans","stripe_plans","sf_id"], errors="ignore").to_csv(index=False).encode("utf-8")
