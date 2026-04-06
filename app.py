@@ -139,7 +139,6 @@ def fetch_stripe_customers_page(api_key, starting_after=None):
         params["starting_after"] = starting_after
     return stripe_get("customers", api_key, params)
 
-@st.cache_data(ttl=300, show_spinner=False)
 def fetch_all_stripe_customers(key_us, key_intl):
     """Fetch all Stripe customers from both accounts, indexed by email domain."""
     domain_index = {}  # domain -> (customer, source)
