@@ -285,10 +285,8 @@ if "sf_access_token" not in st.session_state:
         st.markdown("### 💳 Stripe × Salesforce")
         st.caption("Live customer billing dashboard")
         st.markdown("<br>", unsafe_allow_html=True)
-        # Use button that navigates in same tab
-        if st.button("🔐 Login with Salesforce", use_container_width=True, type="primary"):
-            st.markdown(f'<meta http-equiv="refresh" content="0; url={get_auth_url()}">', unsafe_allow_html=True)
-        st.markdown(f'<a href="{get_auth_url()}" target="_self" style="display:block; text-align:center; margin-top:8px; font-size:12px; color:#6b7280;">Click here if not redirected</a>', unsafe_allow_html=True)
+        st.link_button("🔐 Login with Salesforce", get_auth_url(),
+                       use_container_width=True, type="primary")
     st.stop()
 
 access_token  = st.session_state["sf_access_token"]
