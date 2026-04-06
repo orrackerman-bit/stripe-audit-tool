@@ -40,7 +40,21 @@ SF_BASE_URL  = "https://logzio.lightning.force.com"
 
 def is_on_demand(text):
     t = (text or "").lower()
-    return "on-demand" in t or "on demand" in t
+    return "on-demand" in t or "on demand" in t or "ondemand" in t
+
+def item_is_on_demand(item):
+    price = item.get("price", {})
+    nickname = price.get("nickname", "") or ""
+    pid = price.get("id", "") or ""
+    # Check product object name if expanded
+    product_obj = price.get("product", {})
+    if isinstance(product_obj, dict):
+        prod_name = product_obj.get("name", "") or ""
+        prod_desc = product_obj.get("description", "") or ""
+    else:
+        prod_name = ""
+        prod_desc = ""
+    return any(is_on_demand(t) for t in [nickname, pid, prod_name, prod_desc])
 
 # --- OAuth ---
 def get_auth_url():
@@ -122,22 +136,26 @@ def stripe_request(endpoint, api_key, params=None):
 
 def stripe_search(query_str, api_key):
     d = stripe_request("customers/search", api_key,
-        {"query": query_str, "limit": 1, "expand[]": "data.subscriptions"})
+        {"query": query_str, "limit": 1,
+         "expand[]": ["data.subscriptions", "data.subscriptions.data.items.data.price.product"]})
     if d and d.get("data"): return d["data"][0]
     return None
 
 def stripe_list_email(email, api_key):
-    d = stripe_request("customers", api_key,
-        {"email": email, "limit": 1, "expand[]": "data.subscriptions"})
-    if d and d.get("data"): return d["data"][0]
+    # List by email, then re-fetch with full expansion
+    d = stripe_request("customers", api_key, {"email": email, "limit": 1})
+    if d and d.get("data"):
+        cus_id = d["data"][0]["id"]
+        full = stripe_request(f"customers/{cus_id}", api_key,
+            {"expand[]": ["subscriptions", "subscriptions.data.items.data.price.product"]})
+        return full
     return None
 
 def stripe_list_all_by_domain(domain, api_key):
-    """Search all customers and filter by email domain — for domain-level matching."""
     if not domain: return None
-    # Use search API with email domain pattern
     d = stripe_request("customers/search", api_key,
-        {"query": f"email~'{domain}'", "limit": 10, "expand[]": "data.subscriptions"})
+        {"query": f"email~'{domain}'", "limit": 10,
+         "expand[]": ["data.subscriptions", "data.subscriptions.data.items.data.price.product"]})
     if d and d.get("data"):
         for c in d["data"]:
             email = c.get("email", "")
@@ -146,36 +164,34 @@ def stripe_list_all_by_domain(domain, api_key):
     return None
 
 def get_stripe_customer(sf_id, parent_key, name, email, email_domain, key_us, key_intl):
-    # Try each matching strategy across both accounts
     for api_key, source in [(key_us, "US"), (key_intl, "Intl")]:
         if not api_key or len(api_key) < 10: continue
-        # 1. Salesforce ID in metadata
+        # 1. Salesforce ID metadata
         if sf_id:
-            c = stripe_search(f"metadata['salesforce_id']:'{sf_id}'", api_key)
+            c = stripe_search(f"metadata[\'salesforce_id\']:'{sf_id}'", api_key)
             if c: return c, source, "Salesforce ID"
-        # 2. Parent account key → main_account_id
+        # 2 & 3. Parent account key
         if parent_key:
-            c = stripe_search(f"metadata['main_account_id']:'{parent_key}'", api_key)
-            if c: return c, source, "Parent Account Key"
-            # 3. Parent account key → our-account-id
-            c = stripe_search(f"metadata['our-account-id']:'{parent_key}'", api_key)
-            if c: return c, source, "Parent Account Key"
+            c = stripe_search(f"metadata[\'main_account_id\']:'{parent_key}'", api_key)
+            if c: return c, source, "Parent Key (main)"
+            c = stripe_search(f"metadata[\'our-account-id\']:'{parent_key}'", api_key)
+            if c: return c, source, "Parent Key (our)"
 
-    # 4. Name search
+    # 4. Name
     for api_key, source in [(key_us, "US"), (key_intl, "Intl")]:
         if not api_key or len(api_key) < 10: continue
         if name:
             c = stripe_search(f"name:'{name}'", api_key)
             if c: return c, source, "Name"
 
-    # 5. Exact email match
+    # 5. Exact email
     for api_key, source in [(key_us, "US"), (key_intl, "Intl")]:
         if not api_key or len(api_key) < 10: continue
         if email and "@" in email:
             c = stripe_list_email(email, api_key)
             if c: return c, source, "Email"
 
-    # 6. Email domain match
+    # 6. Email domain
     for api_key, source in [(key_us, "US"), (key_intl, "Intl")]:
         if not api_key or len(api_key) < 10: continue
         if email_domain:
@@ -220,7 +236,7 @@ def get_mrr(customer):
             nickname = price.get("nickname", "") or ""
             pid = price.get("id", "") or ""
             # Skip on-demand items
-            if is_on_demand(nickname) or is_on_demand(pid): continue
+            if item_is_on_demand(item): continue
             amount = (price.get("unit_amount", 0) or 0) / 100
             qty = item.get("quantity", 1) or 1
             interval = price.get("recurring", {}).get("interval", "month")
@@ -247,7 +263,7 @@ def get_stripe_plans(customer):
             pid = price.get("id", "") or ""
             product = nickname or pid
             # Skip on-demand
-            if is_on_demand(product): continue
+            if item_is_on_demand(item): continue
             amount = (price.get("unit_amount", 0) or 0) / 100
             qty = item.get("quantity", 1) or 1
             interval = price.get("recurring", {}).get("interval", "month")
