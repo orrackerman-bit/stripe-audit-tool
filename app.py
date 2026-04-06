@@ -79,7 +79,7 @@ def fetch_sf_accounts(access_token, instance_url):
                Billing_Email_Address__c, Website, All_Time_ARR__c,
                (SELECT Name, ARR__c, Unit__c, Start_Date__c, End_Date__c,
                        Logging_Retention_Days__c, Active__c
-                FROM Plans__r)
+                FROM Contract_Assets__r)
         FROM Account
         WHERE Type = 'Customer'
           AND All_Time_ARR__c > 0
