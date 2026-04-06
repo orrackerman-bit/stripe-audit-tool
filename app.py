@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import time
+import concurrent.futures
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
@@ -12,12 +13,12 @@ st.markdown("""
     .block-container { padding-top: 1.5rem; max-width: 1400px; }
     .stat-num { font-size: 2rem; font-weight: 700; margin-bottom: 0.25rem; }
     .stat-label { font-size: 0.8rem; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em; }
-    .num-active  { color: #16a34a; }
-    .num-pastdue { color: #d97706; }
-    .num-cancels { color: #7c3aed; }
-    .num-canceled{ color: #dc2626; }
+    .num-active   { color: #16a34a; }
+    .num-pastdue  { color: #d97706; }
+    .num-cancels  { color: #7c3aed; }
+    .num-canceled { color: #dc2626; }
+    .num-unpaid   { color: #b45309; }
     div[data-testid="stMetric"] { background: #f9fafb; border-radius: 10px; padding: 0.75rem; }
-    div[data-testid="stHorizontalBlock"] button[kind="secondary"] { font-size: 12px !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -35,6 +36,7 @@ except Exception:
 REDIRECT_URI = "https://logz-stripe-audit.streamlit.app/"
 AUTH_URL     = f"https://{SFDC_DOMAIN}/services/oauth2/authorize"
 TOKEN_URL    = f"https://{SFDC_DOMAIN}/services/oauth2/token"
+SF_BASE_URL  = f"https://logzio.lightning.force.com"
 
 # --- OAuth ---
 def get_auth_url():
@@ -78,9 +80,11 @@ def fetch_sf_accounts(access_token, instance_url):
     soql = """
         SELECT Id, Name, BillingCountry, BillingState,
                Billing_Email_Address__c, Website, All_Time_ARR__c,
+               Logz_Io_Parent_Account_Key__c,
                (SELECT Name, ARR__c, Unit__c, Start_Date__c, End_Date__c,
                        Logging_Retention_Days__c, Active__c
-                FROM Contract_Assets__r)
+                FROM Contract_Assets__r
+                WHERE Active__c = TRUE)
         FROM Account
         WHERE Type = 'Customer'
           AND All_Time_ARR__c > 0
@@ -104,63 +108,51 @@ def fetch_sf_accounts(access_token, instance_url):
 # --- Stripe ---
 def stripe_request(endpoint, api_key, params=None):
     try:
-        r = requests.get(
-            f"https://api.stripe.com/v1/{endpoint}",
+        r = requests.get(f"https://api.stripe.com/v1/{endpoint}",
             params=params or {},
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=10
-        )
-        if r.status_code != 200:
-            return None
+            headers={"Authorization": f"Bearer {api_key}"}, timeout=10)
+        if r.status_code != 200: return None
         return r.json()
-    except:
-        return None
+    except: return None
 
 def stripe_search_customer(query_str, api_key):
-    d = stripe_request("customers/search", api_key, {
-        "query": query_str,
-        "limit": 1,
-        "expand[]": "data.subscriptions"
-    })
-    if d and d.get("data"):
-        return d["data"][0]
+    d = stripe_request("customers/search", api_key,
+        {"query": query_str, "limit": 1, "expand[]": "data.subscriptions"})
+    if d and d.get("data"): return d["data"][0]
     return None
 
-def stripe_list_customer_by_email(email, api_key):
-    """Use list endpoint as fallback — more reliable than search for email."""
-    d = stripe_request("customers", api_key, {
-        "email": email,
-        "limit": 1,
-        "expand[]": "data.subscriptions"
-    })
-    if d and d.get("data"):
-        return d["data"][0]
+def stripe_list_by_email(email, api_key):
+    d = stripe_request("customers", api_key,
+        {"email": email, "limit": 1, "expand[]": "data.subscriptions"})
+    if d and d.get("data"): return d["data"][0]
     return None
 
-def get_stripe_customer(sf_id, name, email, key_us, key_intl):
+def get_stripe_customer(sf_id, parent_key, name, email, key_us, key_intl):
     for api_key, source in [(key_us, "US"), (key_intl, "Intl")]:
-        if not api_key or len(api_key) < 10:
-            continue
-        # 1. Metadata: salesforce_id
+        if not api_key or len(api_key) < 10: continue
+        # 1. Salesforce ID in metadata
         c = stripe_search_customer(f"metadata['salesforce_id']:'{sf_id}'", api_key)
-        if c: return c, source, "sf_id"
-        # 2. Metadata: our-account-id
-        c = stripe_search_customer(f"metadata['our-account-id']:'{sf_id}'", api_key)
-        if c: return c, source, "sf_id(alt)"
+        if c: return c, source, "Salesforce ID"
+        # 2. Parent account key (main_account_id / our-account-id)
+        if parent_key:
+            c = stripe_search_customer(f"metadata['main_account_id']:'{parent_key}'", api_key)
+            if c: return c, source, "Parent Account Key"
+            c = stripe_search_customer(f"metadata['our-account-id']:'{parent_key}'", api_key)
+            if c: return c, source, "Parent Account Key"
 
-    # 3. Name search both accounts
+    # 3. Name search
     for api_key, source in [(key_us, "US"), (key_intl, "Intl")]:
         if not api_key or len(api_key) < 10: continue
         if name:
             c = stripe_search_customer(f"name:'{name}'", api_key)
-            if c: return c, source, "name"
+            if c: return c, source, "Name"
 
-    # 4. Email — use list endpoint (exact match, more reliable)
+    # 4. Email
     for api_key, source in [(key_us, "US"), (key_intl, "Intl")]:
         if not api_key or len(api_key) < 10: continue
         if email and "@" in email:
-            c = stripe_list_customer_by_email(email, api_key)
-            if c: return c, source, "email"
+            c = stripe_list_by_email(email, api_key)
+            if c: return c, source, "Email"
 
     return None, None, None
 
@@ -168,16 +160,17 @@ def get_stripe_status(customer):
     if not customer: return "not_found", None
     subs = customer.get("subscriptions", {}).get("data", [])
     if not subs: return "no_subscription", None
-    # Active + scheduled to cancel
     for s in subs:
         if s.get("status") == "active" and s.get("cancel_at_period_end"):
             ts = s.get("cancel_at")
             date = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%b %d") if ts else "?"
             return "cancels_on", date
     for s in subs:
-        if s.get("status") == "active": return "active", None
+        if s.get("status") == "active":   return "active", None
     for s in subs:
         if s.get("status") == "past_due": return "past_due", None
+    for s in subs:
+        if s.get("status") == "unpaid":   return "unpaid", None
     for s in subs:
         if s.get("status") == "canceled":
             ts = s.get("canceled_at")
@@ -189,7 +182,7 @@ def get_mrr(customer):
     if not customer: return 0
     total = 0
     for s in (customer.get("subscriptions", {}).get("data", []) or []):
-        if s.get("status") in ["active", "past_due"]:
+        if s.get("status") in ["active", "past_due", "unpaid"]:
             for item in s.get("items", {}).get("data", []):
                 price = item.get("price", {})
                 amount = (price.get("unit_amount", 0) or 0) / 100
@@ -215,6 +208,9 @@ def get_stripe_plans(customer):
         for item in s.get("items", {}).get("data", []):
             price = item.get("price", {})
             product = price.get("nickname") or price.get("id", "")
+            # Skip on-demand products
+            if "on-demand" in product.lower() or "on demand" in product.lower():
+                continue
             amount = (price.get("unit_amount", 0) or 0) / 100
             qty = item.get("quantity", 1) or 1
             interval = price.get("recurring", {}).get("interval", "month")
@@ -228,6 +224,15 @@ def get_stripe_plans(customer):
                 "Status":    display_status,
             })
     return plans
+
+def get_stripe_customer_url(customer, source):
+    if not customer: return None
+    cus_id = customer.get("id", "")
+    if not cus_id: return None
+    if source == "US":
+        return f"https://dashboard.stripe.com/customers/{cus_id}"
+    else:
+        return f"https://dashboard.stripe.com/customers/{cus_id}"
 
 # --- OAuth callback ---
 auth_code = st.query_params.get("code", None)
@@ -307,27 +312,27 @@ with col3:
 
 # --- Check Stripe (parallel) ---
 if "all_results" not in st.session_state:
-    import concurrent.futures
     raw = st.session_state.get("sf_raw", [])
     results = [None] * len(raw)
     prog = st.progress(0, text="Checking Stripe...")
-    txt  = st.empty()
     completed = [0]
 
     def process_account(args):
         i, r = args
-        name    = r.get("Name", "")
-        email   = (r.get("Billing_Email_Address__c") or "").strip().lower()
-        arr     = r.get("All_Time_ARR__c", 0) or 0
-        country = r.get("BillingCountry", "") or ""
-        sf_id   = r.get("Id", "")
+        name       = r.get("Name", "")
+        email      = (r.get("Billing_Email_Address__c") or "").strip().lower()
+        arr        = r.get("All_Time_ARR__c", 0) or 0
+        country    = r.get("BillingCountry", "") or ""
+        sf_id      = r.get("Id", "")
+        parent_key = str(r.get("Logz_Io_Parent_Account_Key__c") or "").strip()
 
         plans_data = r.get("Contract_Assets__r") or {}
         plans = []
         for p in (plans_data.get("records") or []):
+            if not p.get("Active__c"): continue
             plans.append({
                 "Plan Name":            p.get("Name", ""),
-                "Active":               "✓" if p.get("Active__c") else "—",
+                "Active":               "✓",
                 "Units":                p.get("Unit__c", "") or "",
                 "ARR":                  p.get("ARR__c", 0) or 0,
                 "Start Date":           p.get("Start_Date__c", "") or "",
@@ -336,13 +341,16 @@ if "all_results" not in st.session_state:
             })
 
         customer, stripe_source, matched_by = get_stripe_customer(
-            sf_id, name, email, STRIPE_US_KEY, STRIPE_INTL_KEY)
+            sf_id, parent_key, name, email, STRIPE_US_KEY, STRIPE_INTL_KEY)
         stripe_status, status_detail = get_stripe_status(customer)
         mrr = get_mrr(customer)
         stripe_plans = get_stripe_plans(customer)
+        stripe_url = get_stripe_customer_url(customer, stripe_source)
+        sf_url = f"{SF_BASE_URL}/lightning/r/Account/{sf_id}/view" if sf_id else None
 
         if stripe_status == "active":            status_label = "Active"
         elif stripe_status == "past_due":        status_label = "Past due"
+        elif stripe_status == "unpaid":          status_label = "Unpaid"
         elif stripe_status == "cancels_on":      status_label = f"Cancels {status_detail}"
         elif stripe_status == "canceled":        status_label = f"Canceled ({status_detail})" if status_detail else "Canceled"
         elif stripe_status == "not_found":       status_label = "Not found"
@@ -363,6 +371,8 @@ if "all_results" not in st.session_state:
             "Stripe Account": stripe_source or "—",
             "sf_plans":       plans,
             "stripe_plans":   stripe_plans,
+            "sf_url":         sf_url,
+            "stripe_url":     stripe_url,
         }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
@@ -371,11 +381,10 @@ if "all_results" not in st.session_state:
             i, result = future.result()
             results[i] = result
             completed[0] += 1
-            pct = completed[0] / len(raw)
-            prog.progress(pct, text=f"Checking accounts... {completed[0]}/{len(raw)}")
+            prog.progress(completed[0] / len(raw),
+                text=f"Checking accounts... {completed[0]}/{len(raw)}")
 
     prog.empty()
-    txt.empty()
     st.session_state["all_results"] = [r for r in results if r is not None]
 
 results = st.session_state["all_results"]
@@ -386,15 +395,16 @@ if search:
 
 n_active   = len(df[df["Stripe Status"] == "active"])
 n_pastdue  = len(df[df["Stripe Status"] == "past_due"])
+n_unpaid   = len(df[df["Stripe Status"] == "unpaid"])
 n_cancels  = len(df[df["Stripe Status"] == "cancels_on"])
 n_canceled = len(df[df["Stripe Status"] == "canceled"])
 
 if "status_filter" not in st.session_state:
     st.session_state["status_filter"] = None
 
-# --- Stat boxes ---
+# --- 5 Stat boxes ---
 st.markdown("<br>", unsafe_allow_html=True)
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 
 def stat_card(col, label, num, css_class, status_key):
     with col:
@@ -415,8 +425,9 @@ def stat_card(col, label, num, css_class, status_key):
 
 stat_card(c1, "Active",          n_active,   "num-active",   "active")
 stat_card(c2, "Past Due",        n_pastdue,  "num-pastdue",  "past_due")
-stat_card(c3, "Cancels w/ Date", n_cancels,  "num-cancels",  "cancels_on")
-stat_card(c4, "Canceled",        n_canceled, "num-canceled", "canceled")
+stat_card(c3, "Unpaid",          n_unpaid,   "num-unpaid",   "unpaid")
+stat_card(c4, "Cancels w/ Date", n_cancels,  "num-cancels",  "cancels_on")
+stat_card(c5, "Canceled",        n_canceled, "num-canceled", "canceled")
 
 # --- Account detail ---
 if "selected_account" in st.session_state:
@@ -429,6 +440,7 @@ if "selected_account" in st.session_state:
     status_colors = {
         "active":      ("#dcfce7","#166534"),
         "past_due":    ("#fef3c7","#92400e"),
+        "unpaid":      ("#fef3c7","#92400e"),
         "cancels_on":  ("#ede9fe","#5b21b6"),
         "canceled":    ("#fee2e2","#991b1b"),
     }
@@ -437,27 +449,37 @@ if "selected_account" in st.session_state:
     col1, col2 = st.columns([3, 1])
     with col1:
         st.markdown(f"## {acct['Account Name']}")
-        st.caption(f"{acct['Billing Email']} · {acct['Country']} · Matched by: {acct['Matched By']} · {acct['Stripe Account']} Stripe account")
+        # Links
+        link_parts = []
+        if acct.get("sf_url"):
+            link_parts.append(f"[Salesforce ↗]({acct['sf_url']})")
+        if acct.get("stripe_url"):
+            link_parts.append(f"[Stripe ↗]({acct['stripe_url']})")
+        if link_parts:
+            st.markdown(" · ".join(link_parts))
+        match_label = acct.get("Matched By", "—")
+        st.caption(f"{acct['Billing Email']} · {acct['Country']} · Found via: {match_label} · {acct['Stripe Account']} Stripe account")
     with col2:
         st.markdown(f"<br><span style='background:{bg_c}; color:{txt_c}; padding:6px 16px; border-radius:20px; font-size:13px; font-weight:600;'>{acct['Status Label']}</span>", unsafe_allow_html=True)
 
     st.divider()
     m1, m2, m3 = st.columns(3)
-    m1.metric("Salesforce All-Time ARR", f"${acct['SF ARR']:,.0f}")
+    m1.metric("Salesforce All-Time ARR", f"${acct['SF ARR']:,.2f}")
     m2.metric("Stripe MRR",              f"${acct['Stripe MRR']:,.2f}")
-    m3.metric("Stripe ARR (MRR×12)",     f"${acct['Stripe ARR']:,.0f}")
+    m3.metric("Stripe ARR (MRR×12)",     f"${acct['Stripe ARR']:,.2f}")
 
     st.divider()
-    tab1, tab2 = st.tabs(["📋 Salesforce Plans", "💳 Stripe Subscriptions"])
+    # Salesforce and Stripe logos as text
+    tab1, tab2 = st.tabs(["☁️ Salesforce Plans", "💳 Stripe Subscriptions"])
 
     with tab1:
         plans = acct.get("sf_plans", [])
         if plans:
             pdf = pd.DataFrame(plans)
-            pdf["ARR"] = pdf["ARR"].apply(lambda x: f"${x:,.0f}" if x else "—")
+            pdf["ARR"] = pdf["ARR"].apply(lambda x: f"${x:,.2f}" if x else "—")
             st.dataframe(pdf, use_container_width=True, hide_index=True)
         else:
-            st.info("No plans found in Salesforce for this account.")
+            st.info("No active plans found in Salesforce for this account.")
 
     with tab2:
         sp = acct.get("stripe_plans", [])
@@ -471,18 +493,18 @@ else:
     status_filter = st.session_state.get("status_filter")
     if status_filter:
         display_df = df[df["Stripe Status"] == status_filter].copy()
-        label_map = {"active":"Active","past_due":"Past Due","cancels_on":"Cancels w/ Date","canceled":"Canceled"}
+        label_map = {"active":"Active","past_due":"Past Due","unpaid":"Unpaid",
+                     "cancels_on":"Cancels w/ Date","canceled":"Canceled"}
         st.markdown(f"### {label_map.get(status_filter,'')} Accounts ({len(display_df)})")
     else:
         display_df = df.copy()
         st.markdown(f"### Account List View ({len(display_df)} accounts)")
 
     status_icons = {
-        "active":"✅","past_due":"⚠️","cancels_on":"🟣",
-        "canceled":"🔴","not_found":"⬜","no_subscription":"⬜"
+        "active":"✅","past_due":"⚠️","unpaid":"🔶",
+        "cancels_on":"🟣","canceled":"🔴","not_found":"⬜","no_subscription":"⬜"
     }
 
-    # Headers
     h1,h2,h3,h4,h5,h6,h7 = st.columns([2.5,1,2,1.2,1.2,1.8,0.8])
     h1.markdown("**Account Name**")
     h2.markdown("**Country**")
@@ -501,13 +523,14 @@ else:
                 st.rerun()
         c2.write(row["Country"] or "—")
         c3.write(row["Billing Email"] or "—")
-        c4.write(f"${row['SF ARR']:,.0f}" if row["SF ARR"] else "—")
-        c5.write(f"${row['Stripe ARR']:,.0f}" if row["Stripe ARR"] else "—")
+        c4.write(f"${row['SF ARR']:,.2f}" if row["SF ARR"] else "—")
+        c5.write(f"${row['Stripe ARR']:,.2f}" if row["Stripe ARR"] else "—")
         icon = status_icons.get(row["Stripe Status"], "⬜")
         c6.write(f"{icon} {row['Status Label']}")
         c7.write(row["Stripe Account"])
 
     st.divider()
-    csv = display_df.drop(columns=["sf_plans","stripe_plans","sf_id"], errors="ignore").to_csv(index=False).encode("utf-8")
+    csv = display_df.drop(columns=["sf_plans","stripe_plans","sf_id","sf_url","stripe_url"],
+                          errors="ignore").to_csv(index=False).encode("utf-8")
     st.download_button("⬇ Download CSV", data=csv,
         file_name=f"stripe_audit_{datetime.today().strftime('%Y-%m-%d')}.csv", mime="text/csv")
