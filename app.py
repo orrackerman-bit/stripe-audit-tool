@@ -42,25 +42,15 @@ def is_on_demand(text):
     t = (text or "").lower()
     return "on-demand" in t or "on demand" in t or "ondemand" in t
 
-def item_is_on_demand(item):
-    price = item.get("price", {})
-    nickname = price.get("nickname", "") or ""
-    pid = price.get("id", "") or ""
-    # Check product object name if expanded
-    product_obj = price.get("product", {})
-    if isinstance(product_obj, dict):
-        prod_name = product_obj.get("name", "") or ""
-        prod_desc = product_obj.get("description", "") or ""
-    else:
-        prod_name = ""
-        prod_desc = ""
-    return any(is_on_demand(t) for t in [nickname, pid, prod_name, prod_desc])
+def email_to_domain(email):
+    if email and "@" in email:
+        return email.strip().lower().split("@")[-1]
+    return ""
 
 # --- OAuth ---
 def get_auth_url():
     params = {"response_type": "code", "client_id": SFDC_CLIENT_ID,
-              "redirect_uri": REDIRECT_URI, "scope": "api refresh_token offline_access",
-              "prompt": "login"}
+              "redirect_uri": REDIRECT_URI, "scope": "api refresh_token offline_access"}
     return f"{AUTH_URL}?{urlencode(params)}"
 
 def exchange_code(code):
@@ -124,8 +114,17 @@ def fetch_sf_accounts(access_token, instance_url):
     """
     return sf_query(soql, access_token, instance_url)
 
-# --- Stripe helpers ---
-def stripe_request(endpoint, api_key, params=None):
+# Build domain → SF account index for fast lookup
+def build_domain_index(raw):
+    index = {}
+    for r in raw:
+        domain = str(r.get("Email_Domain__c") or "").strip().lower()
+        if domain:
+            index[domain] = r
+    return index
+
+# --- Stripe ---
+def stripe_get(endpoint, api_key, params=None):
     try:
         r = requests.get(f"https://api.stripe.com/v1/{endpoint}",
             params=params or {},
@@ -134,79 +133,69 @@ def stripe_request(endpoint, api_key, params=None):
         return r.json()
     except: return None
 
-def stripe_search(query_str, api_key):
-    d = stripe_request("customers/search", api_key,
-        {"query": query_str, "limit": 1,
-         "expand[]": ["data.subscriptions", "data.subscriptions.data.items.data.price.product"]})
-    if d and d.get("data"): return d["data"][0]
-    return None
+def fetch_stripe_customers_page(api_key, starting_after=None):
+    params = {"limit": 100, "expand[]": "data.subscriptions"}
+    if starting_after:
+        params["starting_after"] = starting_after
+    return stripe_get("customers", api_key, params)
 
-def stripe_list_email(email, api_key):
-    # List by email, then re-fetch with full expansion
-    d = stripe_request("customers", api_key, {"email": email, "limit": 1})
-    if d and d.get("data"):
-        cus_id = d["data"][0]["id"]
-        full = stripe_request(f"customers/{cus_id}", api_key,
-            {"expand[]": ["subscriptions", "subscriptions.data.items.data.price.product"]})
-        return full
-    return None
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_all_stripe_customers(key_us, key_intl):
+    """Fetch all Stripe customers from both accounts, indexed by email domain."""
+    domain_index = {}  # domain -> (customer, source)
+    sf_id_index  = {}  # salesforce_id metadata -> (customer, source)
+    parent_index = {}  # main_account_id / our-account-id -> (customer, source)
 
-def stripe_list_all_by_domain(domain, api_key):
-    if not domain: return None
-    d = stripe_request("customers/search", api_key,
-        {"query": f"email~'{domain}'", "limit": 10,
-         "expand[]": ["data.subscriptions", "data.subscriptions.data.items.data.price.product"]})
-    if d and d.get("data"):
-        for c in d["data"]:
-            email = c.get("email", "")
-            if email and email.lower().endswith(f"@{domain.lower()}"):
-                return c
-    return None
-
-def get_stripe_customer(sf_id, parent_key, name, email, email_domain, key_us, key_intl):
     for api_key, source in [(key_us, "US"), (key_intl, "Intl")]:
-        if not api_key or len(api_key) < 10: continue
-        # 1. Salesforce ID metadata
-        if sf_id:
-            c = stripe_search(f"metadata[\'salesforce_id\']:'{sf_id}'", api_key)
-            if c: return c, source, "Salesforce ID"
-        # 2 & 3. Parent account key
-        if parent_key:
-            c = stripe_search(f"metadata[\'main_account_id\']:'{parent_key}'", api_key)
-            if c: return c, source, "Parent Key (main)"
-            c = stripe_search(f"metadata[\'our-account-id\']:'{parent_key}'", api_key)
-            if c: return c, source, "Parent Key (our)"
+        if not api_key or len(api_key) < 10:
+            continue
+        starting_after = None
+        while True:
+            data = fetch_stripe_customers_page(api_key, starting_after)
+            if not data or not data.get("data"):
+                break
+            for c in data["data"]:
+                # Index by email domain
+                email = (c.get("email") or "").lower()
+                domain = email_to_domain(email)
+                if domain and domain not in domain_index:
+                    domain_index[domain] = (c, source)
 
-    # 4. Name
-    for api_key, source in [(key_us, "US"), (key_intl, "Intl")]:
-        if not api_key or len(api_key) < 10: continue
-        if name:
-            c = stripe_search(f"name:'{name}'", api_key)
-            if c: return c, source, "Name"
+                # Index by metadata
+                meta = c.get("metadata") or {}
+                sf_id = meta.get("salesforce_id", "")
+                if sf_id and sf_id not in sf_id_index:
+                    sf_id_index[sf_id] = (c, source)
 
-    # 5. Exact email
-    for api_key, source in [(key_us, "US"), (key_intl, "Intl")]:
-        if not api_key or len(api_key) < 10: continue
-        if email and "@" in email:
-            c = stripe_list_email(email, api_key)
-            if c: return c, source, "Email"
+                main_id = str(meta.get("main_account_id", "") or "").strip()
+                our_id  = str(meta.get("our-account-id", "") or "").strip()
+                for mid in [main_id, our_id]:
+                    if mid and mid not in parent_index:
+                        parent_index[mid] = (c, source)
 
-    # 6. Email domain
-    for api_key, source in [(key_us, "US"), (key_intl, "Intl")]:
-        if not api_key or len(api_key) < 10: continue
-        if email_domain:
-            c = stripe_list_all_by_domain(email_domain, api_key)
-            if c: return c, source, "Email Domain"
+            if not data.get("has_more"):
+                break
+            starting_after = data["data"][-1]["id"]
 
+    return sf_id_index, parent_index, domain_index
+
+def get_stripe_customer_from_index(sf_id, parent_key, email_domain,
+                                    sf_id_index, parent_index, domain_index):
+    # 1. Salesforce ID
+    if sf_id and sf_id in sf_id_index:
+        return sf_id_index[sf_id][0], sf_id_index[sf_id][1], "Salesforce ID"
+    # 2. Parent key (main_account_id / our-account-id)
+    pk = str(parent_key or "").strip()
+    if pk and pk in parent_index:
+        return parent_index[pk][0], parent_index[pk][1], "Parent Account Key"
+    # 3. Email domain
+    if email_domain and email_domain in domain_index:
+        return domain_index[email_domain][0], domain_index[email_domain][1], "Email Domain"
     return None, None, None
 
 def get_stripe_status(customer):
     if not customer: return "not_found", None
-    # Filter out on-demand-only subscriptions
-    subs = [s for s in (customer.get("subscriptions", {}).get("data", []) or [])
-            if not all(is_on_demand(item.get("price", {}).get("nickname", "") or
-                                    item.get("price", {}).get("id", ""))
-                      for item in s.get("items", {}).get("data", []))]
+    subs = customer.get("subscriptions", {}).get("data", []) or []
     if not subs: return "no_subscription", None
     for s in subs:
         if s.get("status") == "active" and s.get("cancel_at_period_end"):
@@ -234,9 +223,7 @@ def get_mrr(customer):
         for item in s.get("items", {}).get("data", []):
             price = item.get("price", {})
             nickname = price.get("nickname", "") or ""
-            pid = price.get("id", "") or ""
-            # Skip on-demand items
-            if item_is_on_demand(item): continue
+            if is_on_demand(nickname): continue
             amount = (price.get("unit_amount", 0) or 0) / 100
             qty = item.get("quantity", 1) or 1
             interval = price.get("recurring", {}).get("interval", "month")
@@ -260,16 +247,13 @@ def get_stripe_plans(customer):
         for item in s.get("items", {}).get("data", []):
             price = item.get("price", {})
             nickname = price.get("nickname", "") or ""
-            pid = price.get("id", "") or ""
-            product = nickname or pid
-            # Skip on-demand
-            if item_is_on_demand(item): continue
+            if is_on_demand(nickname): continue
             amount = (price.get("unit_amount", 0) or 0) / 100
             qty = item.get("quantity", 1) or 1
             interval = price.get("recurring", {}).get("interval", "month")
             total = round(amount * qty, 2)
             plans.append({
-                "Product":   product,
+                "Product":   nickname or price.get("id", ""),
                 "Price":     f"${amount:,.2f}",
                 "Qty":       qty,
                 "Total/mo":  f"${total:,.2f}",
@@ -278,7 +262,7 @@ def get_stripe_plans(customer):
             })
     return plans
 
-# --- OAuth callback — stays in same tab ---
+# --- OAuth callback ---
 auth_code = st.query_params.get("code", None)
 if auth_code and "sf_access_token" not in st.session_state:
     with st.spinner("Logging in with Salesforce..."):
@@ -309,9 +293,9 @@ access_token  = st.session_state["sf_access_token"]
 refresh_token = st.session_state["sf_refresh_token"]
 instance_url  = st.session_state["sf_instance_url"]
 
-# --- Load SF data ---
+# --- Load data ---
 if "data_loaded" not in st.session_state:
-    with st.spinner("Loading accounts from Salesforce..."):
+    with st.spinner("Loading Salesforce accounts..."):
         try:
             raw = fetch_sf_accounts(access_token, instance_url)
             st.session_state["sf_raw"] = raw
@@ -324,6 +308,15 @@ if "data_loaded" not in st.session_state:
                 st.rerun()
             st.error(f"Salesforce error: {e}")
             st.stop()
+
+if "stripe_indexed" not in st.session_state:
+    with st.spinner("Fetching all Stripe customers..."):
+        sf_id_idx, parent_idx, domain_idx = fetch_all_stripe_customers(
+            STRIPE_US_KEY, STRIPE_INTL_KEY)
+        st.session_state["sf_id_idx"]   = sf_id_idx
+        st.session_state["parent_idx"]  = parent_idx
+        st.session_state["domain_idx"]  = domain_idx
+        st.session_state["stripe_indexed"] = True
 
 # --- Header ---
 col1, col2, col3 = st.columns([4, 2, 1])
@@ -342,24 +335,28 @@ with col3:
             st.session_state["status_filter"] = None
             st.rerun()
     with c3b:
-        if st.button("🔄", help="Refresh data"):
+        if st.button("🔄", help="Refresh"):
             fetch_sf_accounts.clear()
-            for k in ["data_loaded","sf_raw","all_results"]:
+            fetch_all_stripe_customers.clear()
+            for k in ["data_loaded","sf_raw","all_results","stripe_indexed",
+                      "sf_id_idx","parent_idx","domain_idx"]:
                 st.session_state.pop(k, None)
             st.rerun()
     with c3c:
         if st.button("↩️", help="Logout"):
-            for k in ["sf_access_token","sf_refresh_token","sf_instance_url",
-                      "data_loaded","sf_raw","all_results","status_filter","selected_account"]:
+            for k in list(st.session_state.keys()):
                 st.session_state.pop(k, None)
             st.rerun()
 
-# --- Check Stripe (parallel) ---
+# --- Match accounts ---
 if "all_results" not in st.session_state:
-    raw = st.session_state.get("sf_raw", [])
-    results = [None] * len(raw)
-    prog = st.progress(0, text="Checking Stripe...")
-    completed = [0]
+    raw        = st.session_state["sf_raw"]
+    sf_id_idx  = st.session_state["sf_id_idx"]
+    parent_idx = st.session_state["parent_idx"]
+    domain_idx = st.session_state["domain_idx"]
+
+    results = []
+    prog = st.progress(0, text="Matching accounts...")
 
     def process_account(args):
         i, r = args
@@ -385,8 +382,9 @@ if "all_results" not in st.session_state:
                 "Log Retention (days)": p.get("Logging_Retention_Days__c", "") or "",
             })
 
-        customer, stripe_source, matched_by = get_stripe_customer(
-            sf_id, parent_key, name, email, email_domain, STRIPE_US_KEY, STRIPE_INTL_KEY)
+        customer, stripe_source, matched_by = get_stripe_customer_from_index(
+            sf_id, parent_key, email_domain, sf_id_idx, parent_idx, domain_idx)
+
         stripe_status, status_detail = get_stripe_status(customer)
         mrr = get_mrr(customer)
         stripe_plans = get_stripe_plans(customer)
@@ -422,17 +420,19 @@ if "all_results" not in st.session_state:
             "stripe_url":     stripe_url,
         }
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+    results_list = [None] * len(raw)
+    completed = [0]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
         futures = {executor.submit(process_account, (i, r)): i for i, r in enumerate(raw)}
         for future in concurrent.futures.as_completed(futures):
             i, result = future.result()
-            results[i] = result
+            results_list[i] = result
             completed[0] += 1
             prog.progress(completed[0] / len(raw),
-                text=f"Checking accounts... {completed[0]}/{len(raw)}")
+                text=f"Matching {completed[0]}/{len(raw)} accounts...")
 
     prog.empty()
-    st.session_state["all_results"] = [r for r in results if r is not None]
+    st.session_state["all_results"] = [r for r in results_list if r is not None]
 
 results = st.session_state["all_results"]
 df = pd.DataFrame(results)
@@ -533,7 +533,6 @@ if "selected_account" in st.session_state:
             st.info("No subscriptions found in Stripe for this account.")
 
 else:
-    # --- List view ---
     status_filter = st.session_state.get("status_filter")
     if status_filter:
         display_df = df[df["Stripe Status"] == status_filter].copy()
