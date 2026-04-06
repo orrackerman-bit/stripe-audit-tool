@@ -305,20 +305,23 @@ with col3:
                 st.session_state.pop(k, None)
             st.rerun()
 
-# --- Check Stripe ---
+# --- Check Stripe (parallel) ---
 if "all_results" not in st.session_state:
+    import concurrent.futures
     raw = st.session_state.get("sf_raw", [])
-    results = []
+    results = [None] * len(raw)
     prog = st.progress(0, text="Checking Stripe...")
     txt  = st.empty()
-    for i, r in enumerate(raw):
+    completed = [0]
+
+    def process_account(args):
+        i, r = args
         name    = r.get("Name", "")
         email   = (r.get("Billing_Email_Address__c") or "").strip().lower()
         arr     = r.get("All_Time_ARR__c", 0) or 0
         country = r.get("BillingCountry", "") or ""
         sf_id   = r.get("Id", "")
 
-        # SF Plans
         plans_data = r.get("Contract_Assets__r") or {}
         plans = []
         for p in (plans_data.get("records") or []):
@@ -331,9 +334,6 @@ if "all_results" not in st.session_state:
                 "End Date":             p.get("End_Date__c", "") or "",
                 "Log Retention (days)": p.get("Logging_Retention_Days__c", "") or "",
             })
-
-        txt.caption(f"Checking {i+1}/{len(raw)}: {name}")
-        prog.progress((i+1)/len(raw))
 
         customer, stripe_source, matched_by = get_stripe_customer(
             sf_id, name, email, STRIPE_US_KEY, STRIPE_INTL_KEY)
@@ -349,26 +349,34 @@ if "all_results" not in st.session_state:
         elif stripe_status == "no_subscription": status_label = "No subscription"
         else:                                    status_label = stripe_status.replace("_"," ").title()
 
-        results.append({
-            "sf_id":            sf_id,
-            "Account Name":     name,
-            "Country":          country,
-            "Billing Email":    email,
-            "SF ARR":           arr,
-            "Stripe MRR":       mrr,
-            "Stripe ARR":       round(mrr * 12, 2),
-            "Stripe Status":    stripe_status,
-            "Status Label":     status_label,
-            "Matched By":       matched_by or "—",
-            "Stripe Account":   stripe_source or "—",
-            "sf_plans":         plans,
-            "stripe_plans":     stripe_plans,
-        })
-        time.sleep(0.05)
+        return i, {
+            "sf_id":          sf_id,
+            "Account Name":   name,
+            "Country":        country,
+            "Billing Email":  email,
+            "SF ARR":         arr,
+            "Stripe MRR":     mrr,
+            "Stripe ARR":     round(mrr * 12, 2),
+            "Stripe Status":  stripe_status,
+            "Status Label":   status_label,
+            "Matched By":     matched_by or "—",
+            "Stripe Account": stripe_source or "—",
+            "sf_plans":       plans,
+            "stripe_plans":   stripe_plans,
+        }
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+        futures = {executor.submit(process_account, (i, r)): i for i, r in enumerate(raw)}
+        for future in concurrent.futures.as_completed(futures):
+            i, result = future.result()
+            results[i] = result
+            completed[0] += 1
+            pct = completed[0] / len(raw)
+            prog.progress(pct, text=f"Checking accounts... {completed[0]}/{len(raw)}")
 
     prog.empty()
     txt.empty()
-    st.session_state["all_results"] = results
+    st.session_state["all_results"] = [r for r in results if r is not None]
 
 results = st.session_state["all_results"]
 df = pd.DataFrame(results)
