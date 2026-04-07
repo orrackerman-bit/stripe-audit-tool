@@ -197,9 +197,10 @@ if "results" not in st.session_state:
     ph1.empty()
 
     ph2 = st.empty()
-    ph2.info("Step 2/3 — Fetching Stripe customers & subscriptions...")
-    all_customers = []
+    ph2.info("Step 2/3 — Fetching Stripe customers...")
     try:
+        # Fetch all Stripe customers (metadata only, no expand) — fast
+        all_customers = []
         for api_key, src in [(STRIPE_US_KEY, "US"), (STRIPE_INTL_KEY, "Intl")]:
             if not api_key or len(api_key) < 10:
                 continue
@@ -209,7 +210,9 @@ if "results" not in st.session_state:
                 if last_id:
                     p2["starting_after"] = last_id
                 r2 = requests.get("https://api.stripe.com/v1/customers",
-                    params=p2, headers={"Authorization": f"Bearer {api_key}"}, timeout=15)
+                    params=p2,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=15)
                 if not r2.ok:
                     break
                 d2 = r2.json()
@@ -218,34 +221,15 @@ if "results" not in st.session_state:
                     break
                 for c in batch:
                     c["_src"] = src
-                    all_customers.append((c, api_key, src))
+                    c["_api_key"] = api_key
+                    all_customers.append(c)
                 if not d2.get("has_more"):
                     break
                 last_id = batch[-1]["id"]
 
-        def fetch_subs(args):
-            c, api_key, src = args
-            try:
-                rs = requests.get("https://api.stripe.com/v1/subscriptions",
-                    params={"customer": c["id"], "limit": 100, "status": "all",
-                            "expand[]": "data.items.data.price.product"},
-                    headers={"Authorization": f"Bearer {api_key}"}, timeout=10)
-                if rs.ok:
-                    return (c["id"], rs.json().get("data", []))
-            except Exception:
-                pass
-            return (c["id"], [])
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
-            subs_results = list(ex.map(fetch_subs, all_customers))
-
-        subs_by_id = {cid: subs for cid, subs in subs_results}
-        fetched = [c for c, _, _ in all_customers]
-        for c in fetched:
-            c["_subs"] = subs_by_id.get(c["id"], [])
-
+        # Build indexes from customer metadata + email domain
         sf_id_idx, parent_idx, domain_idx = {}, {}, {}
-        for c in fetched:
+        for c in all_customers:
             meta = c.get("metadata") or {}
             sid = (meta.get("salesforce_id") or "").strip()
             if sid:
@@ -260,6 +244,58 @@ if "results" not in st.session_state:
             dom2 = em.split("@")[-1] if "@" in em else ""
             if dom2 and dom2 not in domain_idx:
                 domain_idx[dom2] = c
+
+        # Build api_key lookup by customer id
+        api_key_by_cid = {c["id"]: c.get("_api_key","") for c in all_customers}
+
+        # Match SF accounts to Stripe customers — find only what we need
+        matched_cids = {}  # customer_id -> api_key
+        for r in sf_records:
+            sf_id   = r.get("Id", "")
+            pkey    = str(r.get("Logz_Io_Parent_Account_Key__c") or "").strip()
+            dom     = str(r.get("Email_Domain__c") or "").strip().lower()
+            sf_id_l = sf_id.lower() if sf_id else ""
+
+            cust = None
+            if sf_id_l and sf_id_l in sf_id_idx:
+                cust = sf_id_idx[sf_id_l]
+            elif sf_id_l and len(sf_id_l) >= 15 and sf_id_l[:15] in sf_id_idx:
+                cust = sf_id_idx[sf_id_l[:15]]
+            elif pkey and pkey in parent_idx:
+                cust = parent_idx[pkey]
+            elif dom and dom in domain_idx:
+                cust = domain_idx[dom]
+
+            if cust:
+                cid = cust["id"]
+                if cid not in matched_cids:
+                    matched_cids[cid] = api_key_by_cid.get(cid, "")
+
+        # Fetch subscriptions only for matched customers
+        def fetch_subs(args):
+            cust_id, api_key = args
+            if not api_key:
+                return (cust_id, [])
+            try:
+                rs = requests.get(
+                    "https://api.stripe.com/v1/subscriptions",
+                    params={"customer": cust_id, "limit": 100, "status": "all",
+                            "expand[]": "data.items.data.price.product"},
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=15)
+                if rs.ok:
+                    return (cust_id, rs.json().get("data", []))
+            except Exception:
+                pass
+            return (cust_id, [])
+
+        to_fetch = list(matched_cids.items())
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
+            subs_map = dict(ex.map(fetch_subs, to_fetch))
+
+        # Attach subs to customer objects in the index
+        for c in all_customers:
+            c["_subs"] = subs_map.get(c["id"], [])
 
     except Exception as e:
         st.error(f"Stripe error: {e}")
