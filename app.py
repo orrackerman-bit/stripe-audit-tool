@@ -74,6 +74,18 @@ def is_on_demand(text):
     t = (text or "").lower()
     return "on-demand" in t or "on demand" in t or "ondemand" in t
 
+def fetch_customer_subscriptions(customer_id, api_key):
+    """Fetch all subscriptions for a customer directly — more reliable than expand."""
+    try:
+        r = requests.get("https://api.stripe.com/v1/subscriptions",
+            params={"customer": customer_id, "limit": 100, "status": "all"},
+            headers={"Authorization": f"Bearer {api_key}"}, timeout=10)
+        if r.ok:
+            return r.json().get("data", [])
+    except Exception:
+        pass
+    return []
+
 def get_auth_url():
     return f"{AUTH_URL}?{urlencode({'response_type':'code','client_id':SFDC_CLIENT_ID,'redirect_uri':REDIRECT_URI,'scope':'api refresh_token offline_access'})}"
 
@@ -287,40 +299,46 @@ if "results" not in st.session_state:
         elif dom and dom in di:
             cust, via = di[dom], "Email Domain"
 
+        # Fetch subscriptions directly (more reliable than expand)
+        subs = []
+        if cust:
+            cust_id = cust.get("id","")
+            cust_src = cust.get("_src","US")
+            api_key_for_cust = STRIPE_US_KEY if cust_src == "US" else STRIPE_INTL_KEY
+            subs = fetch_customer_subscriptions(cust_id, api_key_for_cust)
+
         # Status
         ss, detail = "not_found", None
-        if cust:
-            subs = (cust.get("subscriptions") or {}).get("data") or []
-            if not subs:
-                ss = "no_subscription"
-            else:
+        if cust and not subs:
+            ss = "no_subscription"
+        elif subs:
+            for s in subs:
+                if s.get("status")=="active" and s.get("cancel_at_period_end"):
+                    ts = s.get("cancel_at")
+                    detail = datetime.fromtimestamp(ts,tz=timezone.utc).strftime("%b %d") if ts else "?"
+                    ss = "cancels_on"; break
+            if ss == "not_found":
                 for s in subs:
-                    if s.get("status")=="active" and s.get("cancel_at_period_end"):
-                        ts = s.get("cancel_at")
-                        detail = datetime.fromtimestamp(ts,tz=timezone.utc).strftime("%b %d") if ts else "?"
-                        ss = "cancels_on"; break
-                if ss == "not_found":
-                    for s in subs:
-                        if s.get("status")=="active":   ss="active"; break
-                if ss == "not_found":
-                    for s in subs:
-                        if s.get("status")=="past_due": ss="past_due"; break
-                if ss == "not_found":
-                    for s in subs:
-                        if s.get("status")=="unpaid":   ss="unpaid"; break
-                if ss == "not_found":
-                    for s in subs:
-                        if s.get("status")=="canceled":
-                            ts = s.get("canceled_at")
-                            detail = datetime.fromtimestamp(ts,tz=timezone.utc).strftime("%b %d, %Y") if ts else "?"
-                            ss="canceled"; break
-                if ss == "not_found":
-                    ss = (subs[0].get("status") or "unknown")
+                    if s.get("status")=="active":   ss="active"; break
+            if ss == "not_found":
+                for s in subs:
+                    if s.get("status")=="past_due": ss="past_due"; break
+            if ss == "not_found":
+                for s in subs:
+                    if s.get("status")=="unpaid":   ss="unpaid"; break
+            if ss == "not_found":
+                for s in subs:
+                    if s.get("status")=="canceled":
+                        ts = s.get("canceled_at")
+                        detail = datetime.fromtimestamp(ts,tz=timezone.utc).strftime("%b %d, %Y") if ts else "?"
+                        ss="canceled"; break
+            if ss == "not_found":
+                ss = (subs[0].get("status") or "unknown")
 
-        # MRR — skip on-demand by fetching product name
+        # MRR — use directly fetched subs, skip on-demand
         mrr = 0.0
-        if cust:
-            for s in ((cust.get("subscriptions") or {}).get("data") or []):
+        if subs:
+            for s in subs:
                 if s.get("status") not in ["active","past_due","unpaid"]: continue
                 for item in (s.get("items") or {}).get("data") or []:
                     price = item.get("price") or {}
@@ -351,8 +369,8 @@ if "results" not in st.session_state:
 
         # Stripe plans
         stripe_plans = []
-        if cust:
-            for s in ((cust.get("subscriptions") or {}).get("data") or []):
+        if subs:
+            for s in subs:
                 st_status = s.get("status","")
                 ca = s.get("cancel_at")
                 cd = datetime.fromtimestamp(ca,tz=timezone.utc).strftime("%b %d, %Y") if ca else None
