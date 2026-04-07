@@ -155,79 +155,80 @@ if "results" not in st.session_state:
 # ── Full data load if no cache ────────────────────────────────────────────────
 if "results" not in st.session_state:
 
-    ph1 = st.empty()
-    ph1.info("Step 1/3 — Loading Salesforce accounts...")
-    sf_records = []
-    try:
-        soql = (
-            "SELECT Id,Name,BillingCountry,Billing_Email_Address__c,"
-            "All_Time_ARR__c,Logz_Io_Parent_Account_Key__c,Email_Domain__c,"
-            "(SELECT Name,ARR__c,Unit__c,Start_Date__c,End_Date__c,"
-            "Logging_Retention_Days__c,Active__c FROM Contract_Assets__r WHERE Active__c=TRUE) "
-            "FROM Account WHERE Type='Customer' AND All_Time_ARR__c>0 "
-            "AND Payment_Method_2__c='Credit Card' "
-            "AND (NOT Name LIKE '%test%') AND (NOT Name LIKE '%Test%') "
-            "AND (NOT Name LIKE '%runrate%') AND (NOT Name LIKE '%Runrate%') "
-            "AND (NOT Name LIKE '%on-demand%') AND (NOT Name LIKE '%On-Demand%') "
-            "AND (NOT Name LIKE '%support%') AND (NOT Name LIKE '%Support%') "
-            "AND (NOT Name LIKE '%logz.io%') AND (NOT Name LIKE '%Logz.io%') "
-            "AND (NOT Name LIKE '%logs.io%') ORDER BY Name ASC"
-        )
-        hdrs = {"Authorization": f"Bearer {token}"}
-        url = f"{instance}/services/data/v59.0/query"
-        params = {"q": soql}
-        while True:
-            r = requests.get(url, headers=hdrs, params=params, timeout=30)
-            if r.status_code == 401:
-                td = refresh_sf_token(refresh)
-                st.session_state["sf_token"] = token = td["access_token"]
-                hdrs = {"Authorization": f"Bearer {token}"}
-                r = requests.get(url, headers=hdrs, params=params, timeout=30)
-            if r.status_code != 200:
-                raise Exception(r.text)
-            d = r.json()
-            sf_records.extend(d.get("records", []))
-            if d.get("done"):
-                break
-            url = instance + d["nextRecordsUrl"]
-            params = {}
-    except Exception as e:
-        st.error(f"Salesforce error: {e}")
-        st.stop()
-    ph1.empty()
-
-    ph2 = st.empty()
-    ph2.info("Step 2/3 — Fetching Stripe customers...")
-    try:
-        # Fetch all Stripe customers (metadata only, no expand) — fast
-        all_customers = []
-        for api_key, src in [(STRIPE_US_KEY, "US"), (STRIPE_INTL_KEY, "Intl")]:
-            if not api_key or len(api_key) < 10:
-                continue
-            last_id = None
+    # ── Step 1: Salesforce ───────────────────────────────────────────────────
+    with st.spinner("Step 1/3 — Loading Salesforce accounts..."):
+        sf_records = []
+        try:
+            soql = (
+                "SELECT Id,Name,BillingCountry,Billing_Email_Address__c,"
+                "All_Time_ARR__c,Logz_Io_Parent_Account_Key__c,Email_Domain__c,"
+                "(SELECT Name,ARR__c,Unit__c,Start_Date__c,End_Date__c,"
+                "Logging_Retention_Days__c,Active__c FROM Contract_Assets__r WHERE Active__c=TRUE) "
+                "FROM Account WHERE Type='Customer' AND All_Time_ARR__c>0 "
+                "AND Payment_Method_2__c='Credit Card' "
+                "AND (NOT Name LIKE '%test%') AND (NOT Name LIKE '%Test%') "
+                "AND (NOT Name LIKE '%runrate%') AND (NOT Name LIKE '%Runrate%') "
+                "AND (NOT Name LIKE '%on-demand%') AND (NOT Name LIKE '%On-Demand%') "
+                "AND (NOT Name LIKE '%support%') AND (NOT Name LIKE '%Support%') "
+                "AND (NOT Name LIKE '%logz.io%') AND (NOT Name LIKE '%Logz.io%') "
+                "AND (NOT Name LIKE '%logs.io%') ORDER BY Name ASC"
+            )
+            hdrs = {"Authorization": f"Bearer {token}"}
+            url = f"{instance}/services/data/v59.0/query"
+            params = {"q": soql}
             while True:
-                p2 = {"limit": 100}
-                if last_id:
-                    p2["starting_after"] = last_id
-                r2 = requests.get("https://api.stripe.com/v1/customers",
-                    params=p2,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    timeout=15)
-                if not r2.ok:
+                r = requests.get(url, headers=hdrs, params=params, timeout=30)
+                if r.status_code == 401:
+                    td = refresh_sf_token(refresh)
+                    st.session_state["sf_token"] = token = td["access_token"]
+                    hdrs = {"Authorization": f"Bearer {token}"}
+                    r = requests.get(url, headers=hdrs, params=params, timeout=30)
+                if r.status_code != 200:
+                    raise Exception(r.text)
+                d = r.json()
+                sf_records.extend(d.get("records", []))
+                if d.get("done"):
                     break
-                d2 = r2.json()
-                batch = d2.get("data", [])
-                if not batch:
-                    break
-                for c in batch:
-                    c["_src"] = src
-                    c["_api_key"] = api_key
-                    all_customers.append(c)
-                if not d2.get("has_more"):
-                    break
-                last_id = batch[-1]["id"]
+                url = instance + d["nextRecordsUrl"]
+                params = {}
+        except Exception as e:
+            st.error(f"Salesforce error: {e}")
+            st.stop()
 
-        # Build indexes from customer metadata + email domain
+    # ── Step 2: Stripe customers (metadata only — fast) ──────────────────────
+    with st.spinner("Step 2/3 — Fetching Stripe customers..."):
+        all_customers = []
+        try:
+            for api_key, src in [(STRIPE_US_KEY, "US"), (STRIPE_INTL_KEY, "Intl")]:
+                if not api_key or len(api_key) < 10:
+                    continue
+                last_id = None
+                while True:
+                    p2 = {"limit": 100}
+                    if last_id:
+                        p2["starting_after"] = last_id
+                    r2 = requests.get("https://api.stripe.com/v1/customers",
+                        params=p2,
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        timeout=15)
+                    if not r2.ok:
+                        break
+                    d2 = r2.json()
+                    batch = d2.get("data", [])
+                    if not batch:
+                        break
+                    for c in batch:
+                        c["_src"] = src
+                        c["_api_key"] = api_key
+                    all_customers.extend(batch)
+                    if not d2.get("has_more"):
+                        break
+                    last_id = batch[-1]["id"]
+        except Exception as e:
+            st.error(f"Stripe fetch error: {e}")
+            st.stop()
+
+        # Build indexes
         sf_id_idx, parent_idx, domain_idx = {}, {}, {}
         for c in all_customers:
             meta = c.get("metadata") or {}
@@ -245,17 +246,12 @@ if "results" not in st.session_state:
             if dom2 and dom2 not in domain_idx:
                 domain_idx[dom2] = c
 
-        # Build api_key lookup by customer id
-        api_key_by_cid = {c["id"]: c.get("_api_key","") for c in all_customers}
-
-        # Match SF accounts to Stripe customers — find only what we need
-        matched_cids = {}  # customer_id -> api_key
+        # Pre-match to find which customers we need subscriptions for
+        needed = {}  # cust_id -> (customer, api_key)
         for r in sf_records:
-            sf_id   = r.get("Id", "")
-            pkey    = str(r.get("Logz_Io_Parent_Account_Key__c") or "").strip()
-            dom     = str(r.get("Email_Domain__c") or "").strip().lower()
-            sf_id_l = sf_id.lower() if sf_id else ""
-
+            sf_id_l = (r.get("Id","") or "").lower()
+            pkey = str(r.get("Logz_Io_Parent_Account_Key__c") or "").strip()
+            dom  = str(r.get("Email_Domain__c") or "").strip().lower()
             cust = None
             if sf_id_l and sf_id_l in sf_id_idx:
                 cust = sf_id_idx[sf_id_l]
@@ -265,48 +261,39 @@ if "results" not in st.session_state:
                 cust = parent_idx[pkey]
             elif dom and dom in domain_idx:
                 cust = domain_idx[dom]
+            if cust and cust["id"] not in needed:
+                needed[cust["id"]] = (cust, cust.get("_api_key",""))
 
-            if cust:
-                cid = cust["id"]
-                if cid not in matched_cids:
-                    matched_cids[cid] = api_key_by_cid.get(cid, "")
-
-        # Fetch subscriptions only for matched customers
-        def fetch_subs(args):
-            cust_id, api_key = args
-            if not api_key:
-                return (cust_id, [])
-            try:
-                rs = requests.get(
-                    "https://api.stripe.com/v1/subscriptions",
-                    params={"customer": cust_id, "limit": 100, "status": "all",
-                            "expand[]": "data.items.data.price.product"},
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    timeout=15)
-                if rs.ok:
-                    return (cust_id, rs.json().get("data", []))
-            except Exception:
-                pass
-            return (cust_id, [])
-
-        to_fetch = list(matched_cids.items())
-        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
-            subs_map = dict(ex.map(fetch_subs, to_fetch))
-
-        # Attach subs to customer objects in the index
-        for c in all_customers:
-            c["_subs"] = subs_map.get(c["id"], [])
-
-    except Exception as e:
-        st.error(f"Stripe error: {e}")
-        st.stop()
-    ph2.empty()
-
-    ph3 = st.empty()
-    ph3.info("Step 3/3 — Matching accounts...")
+    # ── Step 3: Fetch subscriptions for matched customers only ────────────────
+    st.write(f"Step 3/3 — Fetching subscriptions for {len(needed)} matched accounts...")
     prog = st.progress(0)
+    subs_map = {}
+    needed_list = list(needed.items())
+    for idx2, (cid, (c, api_key)) in enumerate(needed_list):
+        try:
+            rs = requests.get(
+                "https://api.stripe.com/v1/subscriptions",
+                params={"customer": cid, "limit": 100, "status": "all",
+                        "expand[]": "data.items.data.price.product"},
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=10)
+            if rs.ok:
+                subs_map[cid] = rs.json().get("data", [])
+            else:
+                subs_map[cid] = []
+        except Exception:
+            subs_map[cid] = []
+        prog.progress((idx2 + 1) / len(needed_list))
+
+    prog.empty()
+
+    # Attach subs to customer objects
+    for cid, (c, _) in needed.items():
+        c["_subs"] = subs_map.get(cid, [])
+
+    # ── Match & build results ─────────────────────────────────────────────────
     rows = []
-    for i, r in enumerate(sf_records):
+    for r in sf_records:
         sf_id   = r.get("Id", "")
         name    = r.get("Name", "")
         arr     = r.get("All_Time_ARR__c") or 0
@@ -345,17 +332,16 @@ if "results" not in st.session_state:
             if s.get("status") == "active" and s.get("cancel_at_period_end"):
                 ts = s.get("cancel_at")
                 detail = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%b %d") if ts else "?"
-                ss = "cancels_on"
-                break
+                ss = "cancels_on"; break
         if ss in ("not_found", "no_subscription"):
             for s in subs:
-                if s.get("status") == "active":    ss = "active";   break
+                if s.get("status") == "active":   ss = "active";   break
         if ss in ("not_found", "no_subscription"):
             for s in subs:
-                if s.get("status") == "past_due":  ss = "past_due"; break
+                if s.get("status") == "past_due": ss = "past_due"; break
         if ss in ("not_found", "no_subscription"):
             for s in subs:
-                if s.get("status") == "unpaid":    ss = "unpaid";   break
+                if s.get("status") == "unpaid":   ss = "unpaid";   break
         if ss in ("not_found", "no_subscription"):
             for s in subs:
                 if s.get("status") == "canceled":
@@ -377,10 +363,10 @@ if "results" not in st.session_state:
                 iv = (price.get("recurring") or {}).get("interval", "month")
                 ic = (price.get("recurring") or {}).get("interval_count", 1) or 1
                 mo = amt * qty
-                if iv == "year":    mo /= (12 * ic)
-                elif iv == "week":  mo = mo * 4.33 / ic
-                elif iv == "day":   mo = mo * 30 / ic
-                else:               mo /= ic
+                if iv == "year":   mo /= (12 * ic)
+                elif iv == "week": mo = mo * 4.33 / ic
+                elif iv == "day":  mo = mo * 30 / ic
+                else:              mo /= ic
                 mrr += mo
         mrr = round(mrr, 2)
 
@@ -425,14 +411,12 @@ if "results" not in st.session_state:
             "sf_url": f"{SF_BASE_URL}/lightning/r/Account/{sf_id}/view" if sf_id else "",
             "stripe_url": f"https://dashboard.stripe.com/customers/{cid}" if cid else ""
         })
-        prog.progress((i + 1) / len(sf_records))
 
-    ph3.empty()
-    prog.empty()
     st.session_state["results"]     = rows
     st.session_state["last_loaded"] = datetime.now().strftime("%b %d, %Y %H:%M")
     st.session_state["from_cache"]  = False
     save_cache(rows)
+    st.rerun()
 
 # ── Render ────────────────────────────────────────────────────────────────────
 df = pd.DataFrame(st.session_state["results"])
