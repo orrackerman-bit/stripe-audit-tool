@@ -75,16 +75,31 @@ def is_on_demand(text):
     return "on-demand" in t or "on demand" in t or "ondemand" in t
 
 def fetch_customer_subscriptions(customer_id, api_key):
-    """Fetch all subscriptions for a customer directly — more reliable than expand."""
+    """Fetch all subscriptions with full product name expansion."""
     try:
         r = requests.get("https://api.stripe.com/v1/subscriptions",
-            params={"customer": customer_id, "limit": 100, "status": "all"},
+            params={"customer": customer_id, "limit": 100, "status": "all",
+                    "expand[]": "data.items.data.price.product"},
             headers={"Authorization": f"Bearer {api_key}"}, timeout=10)
         if r.ok:
             return r.json().get("data", [])
     except Exception:
         pass
     return []
+
+def get_product_name(item):
+    """Extract real product name from a subscription line item."""
+    price = item.get("price") or {}
+    # Try expanded product object first
+    prod = price.get("product")
+    if isinstance(prod, dict):
+        name = prod.get("name","") or prod.get("description","") or ""
+        if name: return name
+    # Fall back to nickname
+    nick = price.get("nickname","") or ""
+    if nick: return nick
+    # Last resort: price id
+    return price.get("id","")
 
 def get_auth_url():
     return f"{AUTH_URL}?{urlencode({'response_type':'code','client_id':SFDC_CLIENT_ID,'redirect_uri':REDIRECT_URI,'scope':'api refresh_token offline_access'})}"
@@ -147,10 +162,10 @@ with c3:
     b1,b2,b3 = st.columns(3)
     with b1:
         if st.button("🏠"):
-            for k in ["selected_account","filter","sel_country","sel_acct",
-                      "sel_status","min_sf","min_stripe","arr_match_filter"]:
+            for k in ["selected_account","filter","saved_filter_state",
+                      "sel_country","sel_acct","sel_status",
+                      "min_sf","min_stripe","arr_match_filter"]:
                 st.session_state.pop(k, None)
-            st.session_state["filter"] = None
             st.rerun()
     with b2:
         if st.button("🔄"):
@@ -335,26 +350,15 @@ if "results" not in st.session_state:
             if ss == "not_found":
                 ss = (subs[0].get("status") or "unknown")
 
-        # MRR — use directly fetched subs, skip on-demand
+        # MRR — use directly fetched subs, skip on-demand using get_product_name
         mrr = 0.0
         if subs:
             for s in subs:
                 if s.get("status") not in ["active","past_due","unpaid"]: continue
                 for item in (s.get("items") or {}).get("data") or []:
+                    product_name = get_product_name(item)
+                    if is_on_demand(product_name): continue
                     price = item.get("price") or {}
-                    nick  = price.get("nickname") or ""
-                    # Fetch product name to check on-demand
-                    prod_obj = price.get("product")
-                    prod_name = ""
-                    if isinstance(prod_obj, dict):
-                        prod_name = prod_obj.get("name","") or ""
-                    elif isinstance(prod_obj, str) and prod_obj:
-                        # fetch product
-                        pr = requests.get(f"https://api.stripe.com/v1/products/{prod_obj}",
-                            headers={"Authorization":f"Bearer {cust.get('_src','') and (STRIPE_US_KEY if cust.get('_src')=='US' else STRIPE_INTL_KEY)}"},
-                            timeout=5)
-                        if pr.ok: prod_name = pr.json().get("name","") or ""
-                    if is_on_demand(nick) or is_on_demand(prod_name): continue
                     amt = (price.get("unit_amount") or 0)/100
                     qty = item.get("quantity") or 1
                     iv  = (price.get("recurring") or {}).get("interval","month")
@@ -376,17 +380,13 @@ if "results" not in st.session_state:
                 cd = datetime.fromtimestamp(ca,tz=timezone.utc).strftime("%b %d, %Y") if ca else None
                 ds = f"Cancels {cd}" if (st_status=="active" and cd) else st_status.replace("_"," ").title()
                 for item in (s.get("items") or {}).get("data") or []:
+                    product_name = get_product_name(item)
+                    if is_on_demand(product_name): continue
                     price = item.get("price") or {}
-                    nick  = price.get("nickname") or ""
-                    prod_obj = price.get("product")
-                    prod_name = ""
-                    if isinstance(prod_obj, dict): prod_name = prod_obj.get("name","") or ""
-                    display_name = nick or prod_name or price.get("id","")
-                    if is_on_demand(nick) or is_on_demand(prod_name): continue
                     amt = (price.get("unit_amount") or 0)/100
                     qty = item.get("quantity") or 1
                     iv  = (price.get("recurring") or {}).get("interval","month")
-                    stripe_plans.append({"Product":display_name,"Price":f"${amt:,.2f}",
+                    stripe_plans.append({"Product":product_name,"Price":f"${amt:,.2f}",
                         "Qty":qty,"Total/mo":f"${round(amt*qty,2):,.2f}",
                         "Frequency":iv.capitalize(),"Status":ds})
 
@@ -451,10 +451,9 @@ if "selected_account" in st.session_state:
     a = st.session_state["selected_account"]
     if st.button("← Back"):
         del st.session_state["selected_account"]
-        # Restore filter state
         saved = st.session_state.pop("saved_filter_state", {})
-        if "filter" in saved:
-            st.session_state["filter"] = saved["filter"]
+        for k, v in saved.items():
+            st.session_state[k] = v
         st.rerun()
     st.divider()
     sc = {"active":("#dcfce7","#166534"),"past_due":("#fef3c7","#92400e"),
@@ -504,24 +503,37 @@ else:
     title = f"{label_map.get(flt,flt)} Accounts" if flt else "Account List View"
 
     with st.expander("🔽 Filters", expanded=False):
+        # Clear All button
+        cl1, cl2 = st.columns([5,1])
+        with cl2:
+            if st.button("✕ Clear all", use_container_width=True):
+                for k in ["sel_country","sel_acct","sel_status","min_sf","min_stripe","arr_match_filter","filter"]:
+                    st.session_state.pop(k, None)
+                st.rerun()
+
         fc1,fc2,fc3 = st.columns(3)
         with fc1:
-            countries = ["All"] + sorted(display["Country"].dropna().unique().tolist())
-            sel_country = st.selectbox("Country", countries, key="sel_country")
+            countries = ["All"] + sorted(df["Country"].dropna().unique().tolist())
+            idx_c = countries.index(st.session_state.get("sel_country","All")) if st.session_state.get("sel_country","All") in countries else 0
+            sel_country = st.selectbox("Country", countries, index=idx_c, key="sel_country")
         with fc2:
             stripe_accts = ["All","US","Intl"]
-            sel_acct = st.selectbox("Stripe Account", stripe_accts, key="sel_acct")
+            idx_a = stripe_accts.index(st.session_state.get("sel_acct","All")) if st.session_state.get("sel_acct","All") in stripe_accts else 0
+            sel_acct = st.selectbox("Stripe Account", stripe_accts, index=idx_a, key="sel_acct")
         with fc3:
             stripe_statuses = ["All","Active","Past due","Unpaid","Cancels w/ Date","Canceled","Not found","No subscription"]
-            sel_status = st.selectbox("Stripe Status", stripe_statuses, key="sel_status")
+            idx_s = stripe_statuses.index(st.session_state.get("sel_status","All")) if st.session_state.get("sel_status","All") in stripe_statuses else 0
+            sel_status = st.selectbox("Stripe Status", stripe_statuses, index=idx_s, key="sel_status")
 
         fc4,fc5,fc6 = st.columns(3)
         with fc4:
-            min_sf = st.number_input("Min SF ARR ($)", min_value=0, value=0, step=100, key="min_sf")
+            min_sf = st.number_input("Min SF ARR ($)", min_value=0, value=int(st.session_state.get("min_sf",0)), step=100, key="min_sf")
         with fc5:
-            min_stripe = st.number_input("Min Stripe ARR ($)", min_value=0, value=0, step=100, key="min_stripe")
+            min_stripe = st.number_input("Min Stripe ARR ($)", min_value=0, value=int(st.session_state.get("min_stripe",0)), step=100, key="min_stripe")
         with fc6:
-            arr_match_filter = st.selectbox("ARR Match", ["All","✅ Match","❌ No match"], key="arr_match_filter")
+            amf_opts = ["All","✅ Match","❌ No match"]
+            idx_m = amf_opts.index(st.session_state.get("arr_match_filter","All")) if st.session_state.get("arr_match_filter","All") in amf_opts else 0
+            arr_match_filter = st.selectbox("ARR Match", amf_opts, index=idx_m, key="arr_match_filter")
 
         if sel_country != "All":
             display = display[display["Country"]==sel_country]
@@ -546,29 +558,36 @@ else:
     icons = {"active":"✅","past_due":"⚠️","unpaid":"🔶","cancels_on":"🟣",
              "canceled":"🔴","not_found":"⬜","no_subscription":"⬜"}
 
-    h = st.columns([2.2,0.9,1.8,1.1,1.1,1.6,0.7,0.9])
+    # Header row
+    h = st.columns([2.5,1,2,1.2,1.2,1.8,0.7,0.8])
     for col,hdr in zip(h,["**Account Name**","**Country**","**Billing Email**",
-                            "**SF ARR**","**Stripe ARR**","**Stripe Status**","**Acct**","**ARR Match**"]):
+                            "**SF ARR**","**Stripe ARR**","**Stripe Status**","**Acct**","**ARR ✓**"]):
         col.markdown(hdr)
-    st.divider()
+    st.markdown('<hr style="margin:4px 0 0 0; border:none; border-top:1.5px solid #e5e7eb">', unsafe_allow_html=True)
 
     for _,row in display.iterrows():
-        c = st.columns([2.2,0.9,1.8,1.1,1.1,1.6,0.7,0.9])
+        c = st.columns([2.5,1,2,1.2,1.2,1.8,0.7,0.8])
         with c[0]:
             if st.button(row["Account Name"], key=f"a_{row['sf_id']}", use_container_width=True):
                 st.session_state["selected_account"] = row.to_dict()
-                # Save current filter state so Back button restores it
                 st.session_state["saved_filter_state"] = {
-                    "filter": st.session_state.get("filter"),
+                    "filter":           st.session_state.get("filter"),
+                    "sel_country":      st.session_state.get("sel_country","All"),
+                    "sel_acct":         st.session_state.get("sel_acct","All"),
+                    "sel_status":       st.session_state.get("sel_status","All"),
+                    "min_sf":           st.session_state.get("min_sf",0),
+                    "min_stripe":       st.session_state.get("min_stripe",0),
+                    "arr_match_filter": st.session_state.get("arr_match_filter","All"),
                 }
                 st.rerun()
-        c[1].write(row["Country"] or "—")
-        c[2].write(row["Billing Email"] or "—")
-        c[3].write(f"${row['SF ARR']:,.2f}" if row["SF ARR"] else "—")
-        c[4].write(f"${row['Stripe ARR']:,.2f}" if row["Stripe ARR"] else "—")
-        c[5].write(f"{icons.get(row['Stripe Status'],'⬜')} {row['Status Label']}")
-        c[6].write(row["Stripe Acct"])
-        c[7].write("✅" if row.get("ARR Match") else "❌")
+        c[1].markdown(f'<div style="padding-top:6px;white-space:nowrap;font-size:13px">{row["Country"] or "—"}</div>', unsafe_allow_html=True)
+        c[2].markdown(f'<div style="padding-top:6px;font-size:12px;word-break:break-all">{row["Billing Email"] or "—"}</div>', unsafe_allow_html=True)
+        c[3].markdown(f'<div style="padding-top:6px;font-size:13px">${row["SF ARR"]:,.2f}</div>' if row["SF ARR"] else '<div style="padding-top:6px">—</div>', unsafe_allow_html=True)
+        c[4].markdown(f'<div style="padding-top:6px;font-size:13px">${row["Stripe ARR"]:,.2f}</div>' if row["Stripe ARR"] else '<div style="padding-top:6px">—</div>', unsafe_allow_html=True)
+        c[5].markdown(f'<div style="padding-top:6px;font-size:13px">{icons.get(row["Stripe Status"],"⬜")} {row["Status Label"]}</div>', unsafe_allow_html=True)
+        c[6].markdown(f'<div style="padding-top:6px;font-size:13px">{row["Stripe Acct"]}</div>', unsafe_allow_html=True)
+        c[7].markdown(f'<div style="padding-top:6px;text-align:center;font-size:16px">{"✅" if row.get("ARR Match") else "❌"}</div>', unsafe_allow_html=True)
+        st.markdown('<hr style="margin:0;border:none;border-top:1px solid #f0f0f0">', unsafe_allow_html=True)
 
     st.divider()
     csv = display.drop(columns=["sf_plans","stripe_plans","sf_id","sf_url","stripe_url"],
