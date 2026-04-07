@@ -94,7 +94,9 @@ with c3:
     b1,b2,b3 = st.columns(3)
     with b1:
         if st.button("🏠"):
-            st.session_state.pop("selected_account",None)
+            for k in ["selected_account","filter","sel_country","sel_acct",
+                      "sel_status","min_sf","min_stripe","arr_match_filter"]:
+                st.session_state.pop(k, None)
             st.session_state["filter"] = None
             st.rerun()
     with b2:
@@ -362,6 +364,10 @@ if "selected_account" in st.session_state:
     a = st.session_state["selected_account"]
     if st.button("← Back"):
         del st.session_state["selected_account"]
+        # Restore filter state
+        saved = st.session_state.pop("saved_filter_state", {})
+        if "filter" in saved:
+            st.session_state["filter"] = saved["filter"]
         st.rerun()
     st.divider()
     sc = {"active":("#dcfce7","#166534"),"past_due":("#fef3c7","#92400e"),
@@ -414,21 +420,21 @@ else:
         fc1,fc2,fc3 = st.columns(3)
         with fc1:
             countries = ["All"] + sorted(display["Country"].dropna().unique().tolist())
-            sel_country = st.selectbox("Country", countries)
+            sel_country = st.selectbox("Country", countries, key="sel_country")
         with fc2:
             stripe_accts = ["All","US","Intl"]
-            sel_acct = st.selectbox("Stripe Account", stripe_accts)
+            sel_acct = st.selectbox("Stripe Account", stripe_accts, key="sel_acct")
         with fc3:
             stripe_statuses = ["All","Active","Past due","Unpaid","Cancels w/ Date","Canceled","Not found","No subscription"]
-            sel_status = st.selectbox("Stripe Status", stripe_statuses)
+            sel_status = st.selectbox("Stripe Status", stripe_statuses, key="sel_status")
 
         fc4,fc5,fc6 = st.columns(3)
         with fc4:
-            min_sf = st.number_input("Min SF ARR ($)", min_value=0, value=0, step=100)
+            min_sf = st.number_input("Min SF ARR ($)", min_value=0, value=0, step=100, key="min_sf")
         with fc5:
-            min_stripe = st.number_input("Min Stripe ARR ($)", min_value=0, value=0, step=100)
+            min_stripe = st.number_input("Min Stripe ARR ($)", min_value=0, value=0, step=100, key="min_stripe")
         with fc6:
-            arr_match_filter = st.selectbox("ARR Match", ["All","✅ Match","❌ No match"])
+            arr_match_filter = st.selectbox("ARR Match", ["All","✅ Match","❌ No match"], key="arr_match_filter")
 
         if sel_country != "All":
             display = display[display["Country"]==sel_country]
@@ -464,6 +470,10 @@ else:
         with c[0]:
             if st.button(row["Account Name"], key=f"a_{row['sf_id']}", use_container_width=True):
                 st.session_state["selected_account"] = row.to_dict()
+                # Save current filter state so Back button restores it
+                st.session_state["saved_filter_state"] = {
+                    "filter": st.session_state.get("filter"),
+                }
                 st.rerun()
         c[1].write(row["Country"] or "—")
         c[2].write(row["Billing Email"] or "—")
