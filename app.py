@@ -1,8 +1,47 @@
 import streamlit as st
 import requests
 import pandas as pd
-from datetime import datetime, timezone
+import json
+import os
+import time
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
+
+CACHE_FILE = "/tmp/stripe_sf_cache.json"
+CACHE_TTL_HOURS = 24
+
+def load_cache():
+    try:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, "r") as f:
+                data = json.load(f)
+            cached_at = datetime.fromisoformat(data.get("cached_at","2000-01-01"))
+            age = datetime.now() - cached_at
+            if age < timedelta(hours=CACHE_TTL_HOURS):
+                return data
+    except Exception:
+        pass
+    return None
+
+def save_cache(sf_accounts, stripe_index, results):
+    try:
+        payload = {
+            "cached_at": datetime.now().isoformat(),
+            "sf_accounts": sf_accounts,
+            "stripe_index": stripe_index,
+            "results": results,
+        }
+        with open(CACHE_FILE, "w") as f:
+            json.dump(payload, f)
+    except Exception:
+        pass
+
+def clear_cache():
+    try:
+        if os.path.exists(CACHE_FILE):
+            os.remove(CACHE_FILE)
+    except Exception:
+        pass
 
 st.set_page_config(page_title="Stripe × Salesforce", page_icon="💳", layout="wide")
 st.markdown("""
@@ -86,7 +125,9 @@ instance = st.session_state["sf_instance"]
 c1,c2,c3 = st.columns([4,2,1])
 with c1:
     st.markdown("## 💳 Stripe Account Statuses")
-    st.caption(f"Last updated: {st.session_state.get('last_loaded','—')}")
+    from_cache = st.session_state.get("from_cache", False)
+    cache_note = " · ⚡ Loaded from cache — hit 🔄 to refresh live data" if from_cache else ""
+    st.caption(f"Last updated: {st.session_state.get('last_loaded','—')}{cache_note}")
 with c2:
     search = st.text_input("🔍 Search", placeholder="Account name...")
 with c3:
@@ -101,13 +142,24 @@ with c3:
             st.rerun()
     with b2:
         if st.button("🔄"):
-            for k in ["sf_accounts","stripe_index","results","last_loaded"]:
+            clear_cache()
+            for k in ["sf_accounts","stripe_index","results","last_loaded","from_cache"]:
                 st.session_state.pop(k,None)
             st.rerun()
     with b3:
         if st.button("↩️"):
             st.session_state.clear()
             st.rerun()
+
+# ── Load from disk cache if available ────────────────────────────────────────
+if "sf_accounts" not in st.session_state:
+    cached = load_cache()
+    if cached:
+        st.session_state["sf_accounts"]  = cached["sf_accounts"]
+        st.session_state["stripe_index"] = cached["stripe_index"]
+        st.session_state["results"]      = cached["results"]
+        st.session_state["last_loaded"]  = cached["cached_at"][:16].replace("T"," ")
+        st.session_state["from_cache"]   = True
 
 # ── Load Salesforce ──────────────────────────────────────────────────────────
 if "sf_accounts" not in st.session_state:
@@ -324,6 +376,8 @@ if "results" not in st.session_state:
 
     prog.empty()
     st.session_state["results"] = rows
+    # Save to disk cache so next login is instant
+    save_cache(st.session_state["sf_accounts"], st.session_state["stripe_index"], rows)
     st.rerun()
 
 # ── Display ──────────────────────────────────────────────────────────────────
