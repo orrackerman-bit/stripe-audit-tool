@@ -265,6 +265,7 @@ if "results" not in st.session_state:
                 if isinstance(prod, str) and prod and prod not in prod_id_to_key:
                     prod_id_to_key[prod] = ak
 
+    prog_text.info(f"🏷️ Step 2/3 — Fetching {len(prod_id_to_key)} product names...")
     product_name_map = {}
     for prod_id, ak in prod_id_to_key.items():
         if not ak:
@@ -433,7 +434,11 @@ if "results" not in st.session_state:
     save_cache(rows)
     st.rerun()
 
-# ── Render ────────────────────────────────────────────────────────────────────
+# ── Render (only runs when results exist — never during loading) ──────────────
+# Guard: stop here if results not yet loaded (prevents stale UI during loading)
+if "results" not in st.session_state:
+    st.stop()
+
 df = pd.DataFrame(st.session_state["results"])
 if search:
     df = df[df["Account Name"].str.contains(search, case=False, na=False)]
