@@ -221,12 +221,21 @@ if "stripe_index" not in st.session_state:
                     for c in batch:
                         c["_src"] = src
                         meta = c.get("metadata") or {}
+
+                        # Index by salesforce_id — normalize to lowercase, try both 15 and 18 char
                         sid = (meta.get("salesforce_id") or "").strip()
-                        if sid and sid not in sf_id_idx: sf_id_idx[sid] = c
+                        if sid:
+                            sf_id_idx[sid.lower()] = c
+                            if len(sid) >= 15:
+                                sf_id_idx[sid[:15].lower()] = c
+
+                        # Index by parent account key
                         for k in ["main_account_id","our-account-id"]:
                             v = str(meta.get(k) or "").strip()
                             if v and v not in parent_idx: parent_idx[v] = c
-                        email = (c.get("email") or "").lower()
+
+                        # Index by email domain from Stripe billing email
+                        email = (c.get("email") or "").lower().strip()
                         dom = email.split("@")[-1] if "@" in email else ""
                         if dom and dom not in domain_idx: domain_idx[dom] = c
                     count += len(batch)
@@ -266,11 +275,17 @@ if "results" not in st.session_state:
                 "End Date":p.get("End_Date__c","") or "",
                 "Log Retention (days)":p.get("Logging_Retention_Days__c","") or ""})
 
-        # Match
+        # Match — try SF ID first (normalize to lowercase, both 15 and 18 char)
         cust, via = None, "—"
-        if sf_id and sf_id in si:   cust, via = si[sf_id], "Salesforce ID"
-        elif pkey and pkey in pi:   cust, via = pi[pkey],  "Parent Key"
-        elif dom and dom in di:     cust, via = di[dom],   "Email Domain"
+        sf_id_lower = sf_id.lower() if sf_id else ""
+        if sf_id_lower and sf_id_lower in si:
+            cust, via = si[sf_id_lower], "Salesforce ID"
+        elif sf_id_lower and sf_id_lower[:15] in si:
+            cust, via = si[sf_id_lower[:15]], "Salesforce ID"
+        elif pkey and pkey in pi:
+            cust, via = pi[pkey], "Parent Key"
+        elif dom and dom in di:
+            cust, via = di[dom], "Email Domain"
 
         # Status
         ss, detail = "not_found", None
