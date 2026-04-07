@@ -156,8 +156,9 @@ if "results" not in st.session_state:
 if "results" not in st.session_state:
 
     # Step 1: Salesforce
-    with st.status("📊 Step 1/3 — Loading Salesforce accounts...", expanded=True) as sf_status:
-        try:
+    _ph1 = st.empty()
+    _ph1.info("📊 Step 1/3 — Loading Salesforce accounts...")
+    try:
             soql = """SELECT Id,Name,BillingCountry,Billing_Email_Address__c,
                 All_Time_ARR__c,Logz_Io_Parent_Account_Key__c,Email_Domain__c,
                 (SELECT Name,ARR__c,Unit__c,Start_Date__c,End_Date__c,
@@ -184,13 +185,14 @@ if "results" not in st.session_state:
                 sf_records.extend(d.get("records",[]))
                 if d.get("done"): break
                 url = instance + d["nextRecordsUrl"]; params = {}
-            sf_status.update(label=f"✅ Step 1/3 — {len(sf_records)} Salesforce accounts loaded", state="complete")
-        except Exception as e:
-            st.error(f"Salesforce error: {e}"); st.stop()
+        _ph1.empty()
+    except Exception as e:
+        st.error(f"Salesforce error: {e}"); st.stop()
 
     # Step 2: Stripe — bulk fetch all customers + subscriptions in parallel
-    with st.status("💳 Step 2/3 — Fetching Stripe customers...", expanded=True) as stripe_status:
-        try:
+    _ph2 = st.empty()
+    _ph2.info("💳 Step 2/3 — Fetching Stripe customers & subscriptions in parallel...")
+    try:
             # Collect all customer IDs first (fast), then fetch subscriptions in parallel
             all_customers = []  # list of (customer_dict, source)
 
@@ -211,24 +213,31 @@ if "results" not in st.session_state:
                     if not d.get("has_more"): break
                     last_id = batch[-1]["id"]
 
-            st.write(f"✓ Found {len(all_customers)} Stripe customers — fetching subscriptions in parallel...")
-
             # Fetch subscriptions for all customers in parallel (20 threads)
             def fetch_subs(args):
                 c, api_key, src = args
+                subs = []
                 try:
                     r = requests.get("https://api.stripe.com/v1/subscriptions",
                         params={"customer":c["id"],"limit":100,"status":"all",
                                 "expand[]":"data.items.data.price.product"},
                         headers={"Authorization":f"Bearer {api_key}"}, timeout=10)
                     if r.ok:
-                        c["_subs"] = r.json().get("data",[])
+                        subs = r.json().get("data",[])
                 except Exception:
-                    c["_subs"] = []
-                return c
+                    pass
+                return (c["id"], subs)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
-                fetched = list(ex.map(fetch_subs, all_customers))
+                subs_results = list(ex.map(fetch_subs, all_customers))
+
+            # Build subs lookup: customer_id -> subs list
+            subs_by_id = {cid: subs for cid, subs in subs_results}
+
+            # Attach subs back to customer objects
+            fetched = [c for c,_,_ in all_customers]
+            for c in fetched:
+                c["_subs"] = subs_by_id.get(c["id"], [])
 
             # Build indexes
             sf_id_idx, parent_idx, domain_idx = {}, {}, {}
@@ -245,14 +254,15 @@ if "results" not in st.session_state:
                 dom = email.split("@")[-1] if "@" in email else ""
                 if dom and dom not in domain_idx: domain_idx[dom] = c
 
-            stripe_status.update(label=f"✅ Step 2/3 — {len(fetched)} Stripe customers indexed", state="complete")
-        except Exception as e:
-            st.error(f"Stripe error: {e}"); st.stop()
+        _ph2.empty()
+    except Exception as e:
+        st.error(f"Stripe error: {e}"); st.stop()
 
     # Step 3: Match
-    with st.status("🔗 Step 3/3 — Matching accounts...", expanded=True) as match_status:
-        rows = []
-        prog = st.progress(0)
+    _ph3 = st.empty()
+    _ph3.info("🔗 Step 3/3 — Matching accounts...")
+    _prog = st.progress(0)
+    rows = []
         for i, r in enumerate(sf_records):
             sf_id  = r.get("Id","")
             name   = r.get("Name","")
@@ -364,10 +374,11 @@ if "results" not in st.session_state:
                 "sf_plans":plans,"stripe_plans":stripe_plans,
                 "sf_url":f"{SF_BASE_URL}/lightning/r/Account/{sf_id}/view" if sf_id else "",
                 "stripe_url":f"https://dashboard.stripe.com/customers/{cid}" if cid else ""})
-            prog.progress((i+1)/len(sf_records))
+            _prog.progress((i+1)/len(sf_records))
 
-        match_status.update(label=f"✅ Step 3/3 — {len(rows)} accounts matched", state="complete")
-        st.session_state["results"]     = rows
+    _ph3.empty()
+    _prog.empty()
+    st.session_state["results"]     = rows
         st.session_state["last_loaded"] = datetime.now().strftime("%b %d, %Y %H:%M")
         st.session_state["from_cache"]  = False
         save_cache(rows)
@@ -532,13 +543,13 @@ else:
                     "arr_match_filter":st.session_state.get("arr_match_filter","All"),
                 }
                 st.rerun()
-        c[1].markdown(f'<div style="padding-top:6px;white-space:nowrap;font-size:13px">{row["Country"] or "—"}</div>', unsafe_allow_html=True)
-        c[2].markdown(f'<div style="padding-top:6px;font-size:12px;word-break:break-all">{row["Billing Email"] or "—"}</div>', unsafe_allow_html=True)
-        c[3].markdown(f'<div style="padding-top:6px;font-size:13px">${row["SF ARR"]:,.2f}</div>' if row["SF ARR"] else '<div style="padding-top:6px">—</div>', unsafe_allow_html=True)
-        c[4].markdown(f'<div style="padding-top:6px;font-size:13px">${row["Stripe ARR"]:,.2f}</div>' if row["Stripe ARR"] else '<div style="padding-top:6px">—</div>', unsafe_allow_html=True)
-        c[5].markdown(f'<div style="padding-top:6px;font-size:13px">{icons.get(row["Stripe Status"],"⬜")} {row["Status Label"]}</div>', unsafe_allow_html=True)
-        c[6].markdown(f'<div style="padding-top:6px;font-size:13px">{row["Stripe Acct"]}</div>', unsafe_allow_html=True)
-        c[7].markdown(f'<div style="padding-top:6px;text-align:center;font-size:16px">{"✅" if row.get("ARR Match") else "❌"}</div>', unsafe_allow_html=True)
+        c[1].markdown(f'<div style="padding-top:6px;white-space:nowrap;font-size:14px">{row["Country"] or "—"}</div>', unsafe_allow_html=True)
+        c[2].markdown(f'<div style="padding-top:6px;font-size:13px;word-break:break-all">{row["Billing Email"] or "—"}</div>', unsafe_allow_html=True)
+        c[3].markdown(f'<div style="padding-top:6px;font-size:14px">${row["SF ARR"]:,.2f}</div>' if row["SF ARR"] else '<div style="padding-top:6px;font-size:14px">—</div>', unsafe_allow_html=True)
+        c[4].markdown(f'<div style="padding-top:6px;font-size:14px">${row["Stripe ARR"]:,.2f}</div>' if row["Stripe ARR"] else '<div style="padding-top:6px;font-size:14px">—</div>', unsafe_allow_html=True)
+        c[5].markdown(f'<div style="padding-top:6px;font-size:14px">{icons.get(row["Stripe Status"],"⬜")} {row["Status Label"]}</div>', unsafe_allow_html=True)
+        c[6].markdown(f'<div style="padding-top:6px;font-size:14px">{row["Stripe Acct"]}</div>', unsafe_allow_html=True)
+        c[7].markdown(f'<div style="padding-top:6px;text-align:center;font-size:17px">{"✅" if row.get("ARR Match") else "❌"}</div>', unsafe_allow_html=True)
         st.markdown('<hr style="margin:0;border:none;border-top:1px solid #f0f0f0">', unsafe_allow_html=True)
 
     st.divider()
