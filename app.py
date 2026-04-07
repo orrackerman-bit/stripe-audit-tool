@@ -253,6 +253,46 @@ if "results" not in st.session_state:
         if dom2 and dom2 not in domain_idx:
             domain_idx[dom2] = c
 
+    # Collect all unique product IDs from subscription items & fetch their names
+    # (typically only 20-50 unique products — very fast one-time fetch)
+    prod_id_to_key = {}  # product_id -> api_key
+    for c in all_customers:
+        ak = c.get("_api_key", "")
+        for s in (c.get("subscriptions") or {}).get("data") or []:
+            for item in (s.get("items") or {}).get("data") or []:
+                price = item.get("price") or {}
+                prod = price.get("product")
+                if isinstance(prod, str) and prod and prod not in prod_id_to_key:
+                    prod_id_to_key[prod] = ak
+
+    product_name_map = {}
+    for prod_id, ak in prod_id_to_key.items():
+        if not ak:
+            continue
+        try:
+            rp = requests.get(f"https://api.stripe.com/v1/products/{prod_id}",
+                headers={"Authorization": f"Bearer {ak}"}, timeout=8)
+            if rp.ok:
+                product_name_map[prod_id] = rp.json().get("name", "") or ""
+        except Exception:
+            product_name_map[prod_id] = ""
+
+    def resolve_product_name(item):
+        price = item.get("price") or {}
+        prod = price.get("product")
+        if isinstance(prod, str) and prod:
+            name = product_name_map.get(prod, "")
+            if name:
+                return name
+        if isinstance(prod, dict):
+            name = prod.get("name", "") or ""
+            if name:
+                return name
+        nick = price.get("nickname", "") or ""
+        if nick:
+            return nick
+        return price.get("id", "")
+
     # ── Step 3: Match & build results ───────────────────────────────────────
     prog_text.info(f"🔗 Step 3/3 — Matching {len(sf_records)} accounts...")
     pbar = prog_bar.progress(0)
@@ -325,10 +365,10 @@ if "results" not in st.session_state:
             if s.get("status") not in ["active", "past_due", "unpaid"]:
                 continue
             for item in (s.get("items") or {}).get("data") or []:
-                price = item.get("price") or {}
-                nick = (price.get("nickname") or "").lower()
-                if is_on_demand(nick):
+                pname = resolve_product_name(item)
+                if is_on_demand(pname):
                     continue
+                price = item.get("price") or {}
                 amt = (price.get("unit_amount") or 0) / 100
                 qty = item.get("quantity") or 1
                 iv = (price.get("recurring") or {}).get("interval", "month")
@@ -349,16 +389,10 @@ if "results" not in st.session_state:
             cd = datetime.fromtimestamp(ca, tz=timezone.utc).strftime("%b %d, %Y") if ca else None
             ds = f"Cancels {cd}" if (st_s == "active" and cd) else st_s.replace("_", " ").title()
             for item in (s.get("items") or {}).get("data") or []:
-                price = item.get("price") or {}
-                nick = price.get("nickname") or ""
-                if is_on_demand(nick):
+                pname = resolve_product_name(item)
+                if is_on_demand(pname):
                     continue
-                # Try to get product name
-                prod = price.get("product")
-                if isinstance(prod, dict):
-                    pname = prod.get("name") or nick or price.get("id", "")
-                else:
-                    pname = nick or price.get("id", "")
+                price = item.get("price") or {}
                 amt = (price.get("unit_amount") or 0) / 100
                 qty = item.get("quantity") or 1
                 iv = (price.get("recurring") or {}).get("interval", "month")
