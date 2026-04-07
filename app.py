@@ -309,9 +309,12 @@ if "results" not in st.session_state:
 
         cid = (cust or {}).get("id","")
         src = (cust or {}).get("_src","—") if cust else "—"
+        stripe_arr = round(mrr*12,2)
+        arr_match = abs((arr or 0) - stripe_arr) < 1.0  # within $1 tolerance
         rows.append({"sf_id":sf_id,"Account Name":name,"Country":country,
-            "Billing Email":email,"SF ARR":arr,"Stripe MRR":mrr,"Stripe ARR":round(mrr*12,2),
-            "Stripe Status":ss,"Status Label":sl,"Found Via":via,"Stripe Acct":src,
+            "Billing Email":email,"SF ARR":arr,"Stripe MRR":mrr,"Stripe ARR":stripe_arr,
+            "ARR Match":arr_match,"Stripe Status":ss,"Status Label":sl,
+            "Found Via":via,"Stripe Acct":src,
             "sf_plans":plans,"stripe_plans":stripe_plans,
             "sf_url":f"{SF_BASE_URL}/lightning/r/Account/{sf_id}/view" if sf_id else "",
             "stripe_url":f"https://dashboard.stripe.com/customers/{cid}" if cid else ""})
@@ -408,7 +411,7 @@ else:
     title = f"{label_map.get(flt,flt)} Accounts" if flt else "Account List View"
 
     with st.expander("🔽 Filters", expanded=False):
-        fc1,fc2,fc3,fc4 = st.columns(4)
+        fc1,fc2,fc3 = st.columns(3)
         with fc1:
             countries = ["All"] + sorted(display["Country"].dropna().unique().tolist())
             sel_country = st.selectbox("Country", countries)
@@ -416,32 +419,48 @@ else:
             stripe_accts = ["All","US","Intl"]
             sel_acct = st.selectbox("Stripe Account", stripe_accts)
         with fc3:
-            min_sf = st.number_input("Min SF ARR ($)", min_value=0, value=0, step=100)
+            stripe_statuses = ["All","Active","Past due","Unpaid","Cancels w/ Date","Canceled","Not found","No subscription"]
+            sel_status = st.selectbox("Stripe Status", stripe_statuses)
+
+        fc4,fc5,fc6 = st.columns(3)
         with fc4:
+            min_sf = st.number_input("Min SF ARR ($)", min_value=0, value=0, step=100)
+        with fc5:
             min_stripe = st.number_input("Min Stripe ARR ($)", min_value=0, value=0, step=100)
+        with fc6:
+            arr_match_filter = st.selectbox("ARR Match", ["All","✅ Match","❌ No match"])
 
         if sel_country != "All":
             display = display[display["Country"]==sel_country]
         if sel_acct != "All":
             display = display[display["Stripe Acct"]==sel_acct]
+        if sel_status != "All":
+            status_map = {"Active":"active","Past due":"past_due","Unpaid":"unpaid",
+                          "Cancels w/ Date":"cancels_on","Canceled":"canceled",
+                          "Not found":"not_found","No subscription":"no_subscription"}
+            display = display[display["Stripe Status"]==status_map.get(sel_status,sel_status)]
         if min_sf > 0:
             display = display[display["SF ARR"]>=min_sf]
         if min_stripe > 0:
             display = display[display["Stripe ARR"]>=min_stripe]
+        if arr_match_filter == "✅ Match":
+            display = display[display["ARR Match"]==True]
+        elif arr_match_filter == "❌ No match":
+            display = display[display["ARR Match"]==False]
 
     st.markdown(f"### {title} ({len(display)})")
 
     icons = {"active":"✅","past_due":"⚠️","unpaid":"🔶","cancels_on":"🟣",
              "canceled":"🔴","not_found":"⬜","no_subscription":"⬜"}
 
-    h = st.columns([2.5,1,2,1.2,1.2,1.8,0.8])
+    h = st.columns([2.2,0.9,1.8,1.1,1.1,1.6,0.7,0.9])
     for col,hdr in zip(h,["**Account Name**","**Country**","**Billing Email**",
-                            "**SF ARR**","**Stripe ARR**","**Stripe Status**","**Acct**"]):
+                            "**SF ARR**","**Stripe ARR**","**Stripe Status**","**Acct**","**ARR Match**"]):
         col.markdown(hdr)
     st.divider()
 
     for _,row in display.iterrows():
-        c = st.columns([2.5,1,2,1.2,1.2,1.8,0.8])
+        c = st.columns([2.2,0.9,1.8,1.1,1.1,1.6,0.7,0.9])
         with c[0]:
             if st.button(row["Account Name"], key=f"a_{row['sf_id']}", use_container_width=True):
                 st.session_state["selected_account"] = row.to_dict()
@@ -452,6 +471,7 @@ else:
         c[4].write(f"${row['Stripe ARR']:,.2f}" if row["Stripe ARR"] else "—")
         c[5].write(f"{icons.get(row['Stripe Status'],'⬜')} {row['Status Label']}")
         c[6].write(row["Stripe Acct"])
+        c[7].write("✅" if row.get("ARR Match") else "❌")
 
     st.divider()
     csv = display.drop(columns=["sf_plans","stripe_plans","sf_id","sf_url","stripe_url"],
