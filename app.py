@@ -190,6 +190,7 @@ if "results" not in st.session_state:
                 raise Exception(r.text)
             d = r.json()
             sf_records.extend(d.get("records", []))
+            prog_text.info(f"📊 Step 1/3 — Loading Salesforce accounts... ({len(sf_records)} loaded)")
             if d.get("done"):
                 break
             url = instance + d["nextRecordsUrl"]
@@ -224,6 +225,7 @@ if "results" not in st.session_state:
                     c["_src"] = src
                     c["_api_key"] = api_key
                 all_customers.extend(batch)
+                prog_text.info(f"💳 Step 2/3 — Fetching Stripe customers... ({len(all_customers)} fetched)")
                 if not d2.get("has_more"):
                     break
                 last_id = batch[-1]["id"]
@@ -268,7 +270,8 @@ if "results" not in st.session_state:
             matched[cust["id"]] = cust
 
     # Fetch subscriptions for matched customers in parallel (fast)
-    prog_text.info(f"Step 2/3 — Fetching subscriptions & payments for {len(matched)} matched accounts...")
+    prog_text.info(f"⚡ Step 2/3 — Fetching subscriptions & payments for {len(matched)} matched accounts in parallel...")
+    prog_bar.progress(0.0)
 
     def fetch_sub_and_charge(args):
         cid, c = args
@@ -316,7 +319,8 @@ if "results" not in st.session_state:
         if charge:
             charge_map[cid] = charge
 
-    prog_bar.empty()
+    prog_text.info(f"🏷️ Step 2/3 — Resolving product names...")
+    prog_bar.progress(0.8)
 
     # Attach subs to customer objects
     for cid, c in matched.items():
@@ -367,8 +371,9 @@ if "results" not in st.session_state:
             return nick
         return price.get("id", "")
 
+    prog_bar.empty()
     # ── Step 3: Match & build results ───────────────────────────────────────
-    prog_text.info(f"Step 3/3 — Matching {len(sf_records)} accounts...")
+    prog_text.info(f"🔗 Step 3/3 — Matching {len(sf_records)} accounts...")
     pbar3 = prog_bar.progress(0)
     rows = []
     for i, r in enumerate(sf_records):
@@ -427,7 +432,8 @@ if "results" not in st.session_state:
                     ts = s.get("canceled_at")
                     detail = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%b %d, %Y") if ts else "?"
                     ss = "canceled"; break
-        # No subscriptions but latest charge succeeded
+        # Succeeded = zero subscriptions of ANY kind AND latest charge succeeded
+        # (fetch used status=all so empty list = truly no subscriptions ever)
         if ss == "no_subscription" and cid and cid in charge_map:
             ch = charge_map[cid]
             if ch.get("status") == "succeeded":
@@ -497,6 +503,7 @@ if "results" not in st.session_state:
             "stripe_url": f"https://dashboard.stripe.com/customers/{cid}" if cid else ""
         })
         pbar3.progress((i + 1) / len(sf_records))
+        prog_text.info(f"🔗 Step 3/3 — Matching accounts... ({i+1}/{len(sf_records)})")
 
     prog_text.empty()
     prog_bar.empty()
