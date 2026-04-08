@@ -294,41 +294,6 @@ if "results" not in st.session_state:
             return nick
         return price.get("id", "")
 
-    # Pre-identify customers with no subscriptions so we can fetch their latest charge
-    # Build set of customer IDs that have no active/any subscriptions
-    no_sub_customer_ids = set()
-    for c in all_customers:
-        subs = (c.get("subscriptions") or {}).get("data") or []
-        if not subs:
-            no_sub_customer_ids.add(c["id"])
-
-    # Fetch latest charge for no-subscription customers (sequential, capped at 1 charge each)
-    prog_text.info(f"🔍 Step 2/3 — Checking latest payments for {len(no_sub_customer_ids)} unsubscribed customers...")
-    latest_charge_map = {}  # customer_id -> {"amount": float, "status": str, "date": str}
-    for c in all_customers:
-        cid = c["id"]
-        if cid not in no_sub_customer_ids:
-            continue
-        ak = c.get("_api_key", "")
-        if not ak:
-            continue
-        try:
-            rc = requests.get("https://api.stripe.com/v1/charges",
-                params={"customer": cid, "limit": 1},
-                headers={"Authorization": f"Bearer {ak}"},
-                timeout=8)
-            if rc.ok:
-                charges = rc.json().get("data", [])
-                if charges:
-                    ch = charges[0]
-                    latest_charge_map[cid] = {
-                        "amount": (ch.get("amount") or 0) / 100,
-                        "status": ch.get("status", ""),
-                        "date": datetime.fromtimestamp(ch.get("created", 0), tz=timezone.utc).strftime("%b %d, %Y") if ch.get("created") else ""
-                    }
-        except Exception:
-            pass
-
     # ── Step 3: Match & build results ───────────────────────────────────────
     prog_text.info(f"🔗 Step 3/3 — Matching {len(sf_records)} accounts...")
     pbar = prog_bar.progress(0)
@@ -394,12 +359,6 @@ if "results" not in st.session_state:
                     ts = s.get("canceled_at")
                     detail = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%b %d, %Y") if ts else "?"
                     ss = "canceled"; break
-        # If no subscriptions but latest charge succeeded → mark as succeeded
-        if ss == "no_subscription" and cust:
-            charge_info = latest_charge_map.get((cust or {}).get("id",""), {})
-            if charge_info.get("status") == "succeeded":
-                ss = "succeeded"
-                detail = '${:,.2f} on {}'.format(charge_info.get('amount', 0), charge_info.get('date', ''))
 
         # MRR
         mrr = 0.0
@@ -448,8 +407,7 @@ if "results" not in st.session_state:
             "active": "Active", "past_due": "Past due", "unpaid": "Unpaid",
             "cancels_on": f"Cancels {detail}",
             "canceled": f"Canceled ({detail})" if detail else "Canceled",
-            "not_found": "Not found", "no_subscription": "No subscription",
-            "succeeded": f"Succeeded ({detail})" if detail else "Succeeded"
+            "not_found": "Not found", "no_subscription": "No subscription"
         }
         sl = sl_map.get(ss, ss)
         cid = (cust or {}).get("id", "")
@@ -485,23 +443,21 @@ df = pd.DataFrame(st.session_state["results"])
 if search:
     df = df[df["Account Name"].str.contains(search, case=False, na=False)]
 
-n_active    = len(df[df["Stripe Status"]=="active"])
-n_pastdue   = len(df[df["Stripe Status"]=="past_due"])
-n_unpaid    = len(df[df["Stripe Status"]=="unpaid"])
-n_cancels   = len(df[df["Stripe Status"]=="cancels_on"])
-n_canceled  = len(df[df["Stripe Status"]=="canceled"])
-n_succeeded = len(df[df["Stripe Status"]=="succeeded"])
+n_active   = len(df[df["Stripe Status"]=="active"])
+n_pastdue  = len(df[df["Stripe Status"]=="past_due"])
+n_unpaid   = len(df[df["Stripe Status"]=="unpaid"])
+n_cancels  = len(df[df["Stripe Status"]=="cancels_on"])
+n_canceled = len(df[df["Stripe Status"]=="canceled"])
 
 if "filter" not in st.session_state:
     st.session_state["filter"] = None
 
 # Stat boxes
 st.markdown("<br>", unsafe_allow_html=True)
-cols = st.columns(6)
+cols = st.columns(5)
 boxes = [("Active",n_active,"num-active","active"),("Past Due",n_pastdue,"num-pastdue","past_due"),
          ("Unpaid",n_unpaid,"num-unpaid","unpaid"),("Cancels w/ Date",n_cancels,"num-cancels","cancels_on"),
-         ("Canceled",n_canceled,"num-canceled","canceled"),
-         ("Succeeded",n_succeeded,"num-active","succeeded")]
+         ("Canceled",n_canceled,"num-canceled","canceled")]
 for col,(label,num,css,key) in zip(cols,boxes):
     with col:
         sel = st.session_state["filter"]==key
@@ -565,7 +521,7 @@ else:
     flt = st.session_state.get("filter")
     display = df[df["Stripe Status"]==flt].copy() if flt else df.copy()
     label_map = {"active":"Active","past_due":"Past Due","unpaid":"Unpaid",
-                 "cancels_on":"Cancels w/ Date","canceled":"Canceled","succeeded":"Succeeded"}
+                 "cancels_on":"Cancels w/ Date","canceled":"Canceled"}
     title = f"{label_map.get(flt,flt)} Accounts" if flt else "Account List View"
 
     # Filters
@@ -593,7 +549,7 @@ else:
             sel_acct = st.selectbox("Stripe Account", accts,
                 index=accts.index(sa_val) if sa_val in accts else 0, key="sel_acct")
         with fc3:
-            statuses = ["All","Active","Past due","Unpaid","Cancels w/ Date","Canceled","Succeeded","Not found","No subscription"]
+            statuses = ["All","Active","Past due","Unpaid","Cancels w/ Date","Canceled","Not found","No subscription"]
             ss_val = st.session_state.get("sel_status","All")
             sel_status = st.selectbox("Stripe Status", statuses,
                 index=statuses.index(ss_val) if ss_val in statuses else 0, key="sel_status")
@@ -612,7 +568,6 @@ else:
 
         smap = {"Active":"active","Past due":"past_due","Unpaid":"unpaid",
                 "Cancels w/ Date":"cancels_on","Canceled":"canceled",
-                "Succeeded":"succeeded",
                 "Not found":"not_found","No subscription":"no_subscription"}
         if sel_country != "All": display = display[display["Country"]==sel_country]
         if sel_acct    != "All": display = display[display["Stripe Acct"]==sel_acct]
@@ -625,7 +580,7 @@ else:
     st.markdown(f"### {title} ({len(display)})")
 
     icons = {"active":"✅","past_due":"⚠️","unpaid":"🔶","cancels_on":"🟣",
-             "canceled":"🔴","succeeded":"💰","not_found":"⬜","no_subscription":"⬜"}
+             "canceled":"🔴","not_found":"⬜","no_subscription":"⬜"}
 
     h = st.columns([2.5,1,2,1.2,1.2,1.8,0.7,0.8])
     for col,hdr in zip(h,["**Account Name**","**Country**","**Billing Email**",
