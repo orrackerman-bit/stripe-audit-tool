@@ -281,7 +281,8 @@ if "results" not in st.session_state:
             return cid, subs, charge
         try:
             rs = requests.get("https://api.stripe.com/v1/subscriptions",
-                params={"customer": cid, "limit": 100, "status": "all"},
+                params={"customer": cid, "limit": 100, "status": "all",
+                        "expand[]": "data.items.data.price.product"},
                 headers={"Authorization": f"Bearer {ak}"}, timeout=10)
             if rs.ok:
                 subs = rs.json().get("data", [])
@@ -319,51 +320,27 @@ if "results" not in st.session_state:
         if charge:
             charge_map[cid] = charge
 
-    prog_text.info(f"🏷️ Step 2/3 — Resolving product names...")
-    prog_bar.progress(0.8)
+    prog_text.info(f"✅ Step 2/3 — {len(matched)} accounts fetched. Building results...")
+    prog_bar.progress(0.95)
 
     # Attach subs to customer objects
     for cid, c in matched.items():
         c["_subs"] = subs_map.get(cid, [])
 
-    # Fetch product names for all unique product IDs
-    prod_id_to_key = {}
-    for c in matched.values():
-        ak = c.get("_api_key", "")
-        for s in c.get("_subs", []):
-            for item in (s.get("items") or {}).get("data") or []:
-                price = item.get("price") or {}
-                prod = price.get("product")
-                if isinstance(prod, str) and prod and prod not in prod_id_to_key:
-                    prod_id_to_key[prod] = ak
-
-    # Fetch product names sequentially — only ~30-50 unique products, very fast
-    product_name_map = {}
-    for prod_id, ak in prod_id_to_key.items():
-        if not ak:
-            continue
-        try:
-            rp = requests.get(f"https://api.stripe.com/v1/products/{prod_id}",
-                headers={"Authorization": f"Bearer {ak}"}, timeout=8)
-            if rp.ok:
-                product_name_map[prod_id] = rp.json().get("name", "") or ""
-        except Exception:
-            pass
-
+    # Product names are now embedded via expand — no separate fetch needed
     def resolve_product_name(item):
         price = item.get("price") or {}
+        # Product is expanded as a dict with name field
         prod = price.get("product")
-        if isinstance(prod, str) and prod:
-            name = product_name_map.get(prod, "")
-            if name:
-                return name
         if isinstance(prod, dict):
             name = prod.get("name", "") or ""
             if name:
                 return name
+        # Fall back to nickname
         nick = price.get("nickname", "") or ""
         if nick:
             return nick
+        # Last resort: price id
         return price.get("id", "")
 
     prog_bar.empty()
