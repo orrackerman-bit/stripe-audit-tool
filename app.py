@@ -337,23 +337,18 @@ if "results" not in st.session_state:
                 if isinstance(prod, str) and prod and prod not in prod_id_to_key:
                     prod_id_to_key[prod] = ak
 
-    def fetch_product_name(args):
-        prod_id, ak = args
+    # Fetch product names sequentially — only ~30-50 unique products, very fast
+    product_name_map = {}
+    for prod_id, ak in prod_id_to_key.items():
+        if not ak:
+            continue
         try:
             rp = requests.get(f"https://api.stripe.com/v1/products/{prod_id}",
                 headers={"Authorization": f"Bearer {ak}"}, timeout=8)
             if rp.ok:
-                return prod_id, rp.json().get("name", "") or ""
+                product_name_map[prod_id] = rp.json().get("name", "") or ""
         except Exception:
             pass
-        return prod_id, ""
-
-    product_name_map = {}
-    if prod_id_to_key:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
-            for pid, name in ex.map(fetch_product_name, prod_id_to_key.items(), timeout=30):
-                if name:
-                    product_name_map[pid] = name
 
     def resolve_product_name(item):
         price = item.get("price") or {}
