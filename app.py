@@ -507,3 +507,193 @@ if "results" not in st.session_state:
     st.rerun()
 
 
+
+# ── Guard: stop here if results not yet loaded ────────────────────────────────
+if "results" not in st.session_state:
+    st.stop()
+
+# ── Render ────────────────────────────────────────────────────────────────────
+df = pd.DataFrame(st.session_state["results"])
+if search:
+    df = df[df["Account Name"].str.contains(search, case=False, na=False)]
+
+n_active    = len(df[df["Stripe Status"]=="active"])
+n_pastdue   = len(df[df["Stripe Status"]=="past_due"])
+n_unpaid    = len(df[df["Stripe Status"]=="unpaid"])
+n_cancels   = len(df[df["Stripe Status"]=="cancels_on"])
+n_canceled  = len(df[df["Stripe Status"]=="canceled"])
+n_succeeded = len(df[df["Stripe Status"]=="succeeded"])
+
+if "filter" not in st.session_state:
+    st.session_state["filter"] = None
+
+# Stat boxes
+st.markdown("<br>", unsafe_allow_html=True)
+cols = st.columns(6)
+boxes = [
+    ("Active",         n_active,    "num-active",   "active"),
+    ("Past Due",       n_pastdue,   "num-pastdue",  "past_due"),
+    ("Unpaid",         n_unpaid,    "num-unpaid",   "unpaid"),
+    ("Cancels w/ Date",n_cancels,   "num-cancels",  "cancels_on"),
+    ("Canceled",       n_canceled,  "num-canceled", "canceled"),
+    ("Succeeded",      n_succeeded, "num-active",   "succeeded"),
+]
+for col,(label,num,css,key) in zip(cols,boxes):
+    with col:
+        sel = st.session_state["filter"]==key
+        st.markdown(f"""<div style="background:{'#f5f3ff' if sel else '#fff'};
+            border:{'2px solid #6366f1' if sel else '1px solid #e5e7eb'};
+            border-radius:12px;padding:1.25rem 1.5rem;text-align:center;margin-bottom:.5rem">
+            <div class="stat-num {css}">{num}</div>
+            <div class="stat-label">{label}</div></div>""", unsafe_allow_html=True)
+        if st.button(f"{'✓ ' if sel else ''}{label}", key=f"b_{key}", use_container_width=True):
+            st.session_state["filter"] = None if sel else key
+            st.session_state.pop("selected_account",None)
+            st.rerun()
+
+# Account detail
+if "selected_account" in st.session_state:
+    a = st.session_state["selected_account"]
+    if st.button("← Back"):
+        del st.session_state["selected_account"]
+        for k,v in st.session_state.pop("saved_filter_state",{}).items():
+            st.session_state[k] = v
+        st.rerun()
+    st.divider()
+    sc = {"active":("#dcfce7","#166534"),"past_due":("#fef3c7","#92400e"),
+          "unpaid":("#fef3c7","#92400e"),"cancels_on":("#ede9fe","#5b21b6"),
+          "canceled":("#fee2e2","#991b1b"),"succeeded":("#dcfce7","#166534")}.get(
+          a["Stripe Status"],("#f3f4f6","#374151"))
+    c1,c2 = st.columns([3,1])
+    with c1:
+        st.markdown(f"## {a['Account Name']}")
+        links = []
+        if a.get("sf_url"):     links.append(f"[☁️ Salesforce]({a['sf_url']})")
+        if a.get("stripe_url"): links.append(f"[💳 Stripe]({a['stripe_url']})")
+        if links: st.markdown(" · ".join(links))
+        st.caption(f"{a['Billing Email']} · {a['Country']} · Found via: {a['Found Via']} · {a['Stripe Acct']} account")
+    with c2:
+        st.markdown(f"<br><span style='background:{sc[0]};color:{sc[1]};padding:6px 16px;"
+                    f"border-radius:20px;font-size:13px;font-weight:600'>{a['Status Label']}</span>",
+                    unsafe_allow_html=True)
+    st.divider()
+    m1,m2,m3 = st.columns(3)
+    m1.metric("Salesforce All-Time ARR", f"${a['SF ARR']:,.2f}")
+    m2.metric("Stripe MRR",              f"${a['Stripe MRR']:,.2f}")
+    m3.metric("Stripe ARR (MRR×12)",     f"${a['Stripe ARR']:,.2f}")
+    st.divider()
+    t1,t2 = st.tabs(["☁️ Salesforce Plans","💳 Stripe Subscriptions"])
+    with t1:
+        pl = a.get("sf_plans",[])
+        if pl:
+            pdf = pd.DataFrame(pl)
+            pdf["ARR"] = pdf["ARR"].apply(lambda x: f"${x:,.2f}" if x else "—")
+            st.dataframe(pdf, use_container_width=True, hide_index=True)
+        else:
+            st.info("No active plans in Salesforce.")
+    with t2:
+        sp = a.get("stripe_plans",[])
+        if sp:
+            st.dataframe(pd.DataFrame(sp), use_container_width=True, hide_index=True)
+        else:
+            st.info("No subscriptions in Stripe.")
+
+else:
+    flt = st.session_state.get("filter")
+    display = df[df["Stripe Status"]==flt].copy() if flt else df.copy()
+    label_map = {"active":"Active","past_due":"Past Due","unpaid":"Unpaid",
+                 "cancels_on":"Cancels w/ Date","canceled":"Canceled","succeeded":"Succeeded"}
+    title = f"{label_map.get(flt,flt)} Accounts" if flt else "Account List View"
+
+    with st.expander("🔽 Filters", expanded=False):
+        cl1,cl2 = st.columns([5,1])
+        with cl2:
+            if st.button("✕ Clear all", use_container_width=True):
+                st.session_state["filter"]           = None
+                st.session_state["sel_country"]      = "All"
+                st.session_state["sel_acct"]         = "All"
+                st.session_state["sel_status"]       = "All"
+                st.session_state["min_sf"]           = 0
+                st.session_state["min_stripe"]       = 0
+                st.session_state["arr_match_filter"] = "All"
+                st.rerun()
+        fc1,fc2,fc3 = st.columns(3)
+        with fc1:
+            countries = ["All"] + sorted(df["Country"].dropna().unique().tolist())
+            sc_val = st.session_state.get("sel_country","All")
+            sel_country = st.selectbox("Country", countries,
+                index=countries.index(sc_val) if sc_val in countries else 0, key="sel_country")
+        with fc2:
+            accts = ["All","US","Intl"]
+            sa_val = st.session_state.get("sel_acct","All")
+            sel_acct = st.selectbox("Stripe Account", accts,
+                index=accts.index(sa_val) if sa_val in accts else 0, key="sel_acct")
+        with fc3:
+            statuses = ["All","Active","Past due","Unpaid","Cancels w/ Date","Canceled","Succeeded","Not found","No subscription"]
+            ss_val = st.session_state.get("sel_status","All")
+            sel_status = st.selectbox("Stripe Status", statuses,
+                index=statuses.index(ss_val) if ss_val in statuses else 0, key="sel_status")
+        fc4,fc5,fc6 = st.columns(3)
+        with fc4:
+            min_sf = st.number_input("Min SF ARR ($)", min_value=0,
+                value=int(st.session_state.get("min_sf",0)), step=100, key="min_sf")
+        with fc5:
+            min_stripe = st.number_input("Min Stripe ARR ($)", min_value=0,
+                value=int(st.session_state.get("min_stripe",0)), step=100, key="min_stripe")
+        with fc6:
+            amf_opts = ["All","✅ Match","❌ No match"]
+            amf_val = st.session_state.get("arr_match_filter","All")
+            arr_match_filter = st.selectbox("ARR Match", amf_opts,
+                index=amf_opts.index(amf_val) if amf_val in amf_opts else 0, key="arr_match_filter")
+
+        smap = {"Active":"active","Past due":"past_due","Unpaid":"unpaid",
+                "Cancels w/ Date":"cancels_on","Canceled":"canceled","Succeeded":"succeeded",
+                "Not found":"not_found","No subscription":"no_subscription"}
+        if sel_country != "All": display = display[display["Country"]==sel_country]
+        if sel_acct    != "All": display = display[display["Stripe Acct"]==sel_acct]
+        if sel_status  != "All": display = display[display["Stripe Status"]==smap.get(sel_status,sel_status)]
+        if min_sf    > 0: display = display[display["SF ARR"]>=min_sf]
+        if min_stripe> 0: display = display[display["Stripe ARR"]>=min_stripe]
+        if arr_match_filter=="✅ Match":     display = display[display["ARR Match"]==True]
+        elif arr_match_filter=="❌ No match": display = display[display["ARR Match"]==False]
+
+    st.markdown(f"### {title} ({len(display)})")
+
+    icons = {"active":"✅","past_due":"⚠️","unpaid":"🔶","cancels_on":"🟣",
+             "canceled":"🔴","succeeded":"💰","not_found":"⬜","no_subscription":"⬜"}
+
+    h = st.columns([2.5,1,2,1.2,1.2,1.8,0.7,0.8])
+    for col,hdr in zip(h,["**Account Name**","**Country**","**Billing Email**",
+                            "**SF ARR**","**Stripe ARR**","**Stripe Status**","**Acct**","**ARR ✓**"]):
+        col.markdown(hdr)
+    st.markdown('<hr style="margin:4px 0 0;border:none;border-top:1.5px solid #e5e7eb">', unsafe_allow_html=True)
+
+    for _,row in display.iterrows():
+        c = st.columns([2.5,1,2,1.2,1.2,1.8,0.7,0.8])
+        with c[0]:
+            if st.button(row["Account Name"], key=f"a_{row['sf_id']}", use_container_width=True):
+                st.session_state["selected_account"] = row.to_dict()
+                st.session_state["saved_filter_state"] = {
+                    "filter":           st.session_state.get("filter"),
+                    "sel_country":      st.session_state.get("sel_country","All"),
+                    "sel_acct":         st.session_state.get("sel_acct","All"),
+                    "sel_status":       st.session_state.get("sel_status","All"),
+                    "min_sf":           st.session_state.get("min_sf",0),
+                    "min_stripe":       st.session_state.get("min_stripe",0),
+                    "arr_match_filter": st.session_state.get("arr_match_filter","All"),
+                }
+                st.rerun()
+        c[1].markdown(f'<div style="padding-top:6px;white-space:nowrap;font-size:14px">{row["Country"] or "—"}</div>', unsafe_allow_html=True)
+        c[2].markdown(f'<div style="padding-top:6px;font-size:13px;word-break:break-all">{row["Billing Email"] or "—"}</div>', unsafe_allow_html=True)
+        c[3].markdown(f'<div style="padding-top:6px;font-size:14px">${row["SF ARR"]:,.2f}</div>' if row["SF ARR"] else '<div style="padding-top:6px;font-size:14px">—</div>', unsafe_allow_html=True)
+        c[4].markdown(f'<div style="padding-top:6px;font-size:14px">${row["Stripe ARR"]:,.2f}</div>' if row["Stripe ARR"] else '<div style="padding-top:6px;font-size:14px">—</div>', unsafe_allow_html=True)
+        c[5].markdown(f'<div style="padding-top:6px;font-size:14px">{icons.get(row["Stripe Status"],"⬜")} {row["Status Label"]}</div>', unsafe_allow_html=True)
+        c[6].markdown(f'<div style="padding-top:6px;font-size:14px">{row["Stripe Acct"]}</div>', unsafe_allow_html=True)
+        c[7].markdown(f'<div style="padding-top:6px;text-align:center;font-size:17px">{"✅" if row.get("ARR Match") else "❌"}</div>', unsafe_allow_html=True)
+        st.markdown('<hr style="margin:0;border:none;border-top:1px solid #f0f0f0">', unsafe_allow_html=True)
+
+    st.divider()
+    csv = display.drop(columns=["sf_plans","stripe_plans","sf_id","sf_url","stripe_url"],
+                       errors="ignore").to_csv(index=False).encode("utf-8")
+    st.download_button("⬇ Download CSV", csv,
+        f"stripe_audit_{datetime.today().strftime('%Y-%m-%d')}.csv","text/csv")
