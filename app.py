@@ -159,7 +159,7 @@ if "results" not in st.session_state:
     prog_bar  = st.empty()
 
     # ── Step 1: Salesforce ───────────────────────────────────────────────────
-    prog_text.info("Step 1/3 — Loading Salesforce accounts...")
+    prog_text.info("📊 Step 1/3 — Loading Salesforce accounts...")
     sf_records = []
     try:
         soql = (
@@ -190,7 +190,6 @@ if "results" not in st.session_state:
                 raise Exception(r.text)
             d = r.json()
             sf_records.extend(d.get("records", []))
-            prog_text.info(f"📊 Step 1/3 — Loading Salesforce accounts... ({len(sf_records)} loaded)")
             if d.get("done"):
                 break
             url = instance + d["nextRecordsUrl"]
@@ -199,16 +198,18 @@ if "results" not in st.session_state:
         st.error(f"Salesforce error: {e}")
         st.stop()
 
-    # ── Step 2: Stripe — fetch customer metadata only (no subscription expand)
-    prog_text.info("Step 2/3 — Fetching Stripe customers...")
+    # ── Step 2: Stripe — bulk fetch WITH subscriptions inline ────────────────
+    # This is the reliable approach: subscriptions embedded in customer response
+    prog_text.info(f"💳 Step 2/3 — Fetching Stripe customers with subscriptions...")
     all_customers = []
     try:
         for api_key, src in [(STRIPE_US_KEY, "US"), (STRIPE_INTL_KEY, "Intl")]:
             if not api_key or len(api_key) < 10:
                 continue
             last_id = None
+            count = 0
             while True:
-                p2 = {"limit": 100}  # NO expand — much faster
+                p2 = {"limit": 100, "expand[]": "data.subscriptions"}
                 if last_id:
                     p2["starting_after"] = last_id
                 r2 = requests.get("https://api.stripe.com/v1/customers",
@@ -225,7 +226,8 @@ if "results" not in st.session_state:
                     c["_src"] = src
                     c["_api_key"] = api_key
                 all_customers.extend(batch)
-                prog_text.info(f"💳 Step 2/3 — Fetching Stripe customers... ({len(all_customers)} fetched)")
+                count += len(batch)
+                prog_text.info(f"💳 Step 2/3 — {src}: {count} customers fetched...")
                 if not d2.get("has_more"):
                     break
                 last_id = batch[-1]["id"]
@@ -251,102 +253,85 @@ if "results" not in st.session_state:
         if dom2 and dom2 not in domain_idx:
             domain_idx[dom2] = c
 
-    # Pre-match to find which ~700 customers we actually need
-    matched = {}  # cust_id -> customer obj
-    for r in sf_records:
-        sf_id_l = (r.get("Id") or "").lower()
-        pkey = str(r.get("Logz_Io_Parent_Account_Key__c") or "").strip()
-        dom  = str(r.get("Email_Domain__c") or "").strip().lower()
-        cust = None
-        if sf_id_l and sf_id_l in sf_id_idx:
-            cust = sf_id_idx[sf_id_l]
-        elif sf_id_l and len(sf_id_l) >= 15 and sf_id_l[:15] in sf_id_idx:
-            cust = sf_id_idx[sf_id_l[:15]]
-        elif pkey and pkey in parent_idx:
-            cust = parent_idx[pkey]
-        elif dom and dom in domain_idx:
-            cust = domain_idx[dom]
-        if cust and cust["id"] not in matched:
-            matched[cust["id"]] = cust
-
-    # Fetch subscriptions for matched customers in parallel (fast)
-    prog_text.info(f"⚡ Step 2/3 — Fetching subscriptions & payments for {len(matched)} matched accounts in parallel...")
-    prog_bar.progress(0.0)
-
-    def fetch_sub_and_charge(args):
-        cid, c = args
+    # Collect all unique product IDs from subscription items & fetch their names
+    # (typically only 20-50 unique products — very fast one-time fetch)
+    prod_id_to_key = {}  # product_id -> api_key
+    for c in all_customers:
         ak = c.get("_api_key", "")
-        subs, charge = [], None
+        for s in (c.get("subscriptions") or {}).get("data") or []:
+            for item in (s.get("items") or {}).get("data") or []:
+                price = item.get("price") or {}
+                prod = price.get("product")
+                if isinstance(prod, str) and prod and prod not in prod_id_to_key:
+                    prod_id_to_key[prod] = ak
+
+    prog_text.info(f"🏷️ Step 2/3 — Fetching {len(prod_id_to_key)} product names...")
+    product_name_map = {}
+    for prod_id, ak in prod_id_to_key.items():
         if not ak:
-            return cid, subs, charge
+            continue
         try:
-            rs = requests.get("https://api.stripe.com/v1/subscriptions",
-                params={"customer": cid, "limit": 100, "status": "all",
-                        "expand[]": "data.items.data.price.product"},
-                headers={"Authorization": f"Bearer {ak}"}, timeout=10)
-            if rs.ok:
-                subs = rs.json().get("data", [])
+            rp = requests.get(f"https://api.stripe.com/v1/products/{prod_id}",
+                headers={"Authorization": f"Bearer {ak}"}, timeout=8)
+            if rp.ok:
+                product_name_map[prod_id] = rp.json().get("name", "") or ""
         except Exception:
-            pass
-        # Only fetch latest charge if no subscriptions
-        if not subs:
-            try:
-                rc = requests.get("https://api.stripe.com/v1/charges",
-                    params={"customer": cid, "limit": 1},
-                    headers={"Authorization": f"Bearer {ak}"}, timeout=8)
-                if rc.ok:
-                    charges = rc.json().get("data", [])
-                    if charges:
-                        ch = charges[0]
-                        charge = {
-                            "amount": (ch.get("amount") or 0) / 100,
-                            "status": ch.get("status", ""),
-                            "date": datetime.fromtimestamp(ch.get("created", 0), tz=timezone.utc).strftime("%b %d, %Y") if ch.get("created") else ""
-                        }
-            except Exception:
-                pass
-        return cid, subs, charge
+            product_name_map[prod_id] = ""
 
-    matched_list = list(matched.items())
-    subs_map = {}
-    charge_map = {}
-
-    # Use map() — no per-result Streamlit updates which freeze the app
-    with concurrent.futures.ThreadPoolExecutor(max_workers=25) as ex:
-        results = list(ex.map(fetch_sub_and_charge, matched_list, timeout=60))
-
-    for cid, subs, charge in results:
-        subs_map[cid] = subs
-        if charge:
-            charge_map[cid] = charge
-
-    prog_text.info(f"✅ Step 2/3 — {len(matched)} accounts fetched. Building results...")
-    prog_bar.progress(0.95)
-
-    # Attach subs to customer objects
-    for cid, c in matched.items():
-        c["_subs"] = subs_map.get(cid, [])
-
-    # Product names are now embedded via expand — no separate fetch needed
     def resolve_product_name(item):
         price = item.get("price") or {}
-        # Product is expanded as a dict with name field
         prod = price.get("product")
+        if isinstance(prod, str) and prod:
+            name = product_name_map.get(prod, "")
+            if name:
+                return name
         if isinstance(prod, dict):
             name = prod.get("name", "") or ""
             if name:
                 return name
-        # Fall back to nickname
         nick = price.get("nickname", "") or ""
         if nick:
             return nick
-        # Last resort: price id
         return price.get("id", "")
 
-    prog_bar.empty()
+    # Pre-identify customers with no subscriptions so we can fetch their latest charge
+    # Build set of customer IDs that have no active/any subscriptions
+    no_sub_customer_ids = set()
+    for c in all_customers:
+        subs = (c.get("subscriptions") or {}).get("data") or []
+        if not subs:
+            no_sub_customer_ids.add(c["id"])
+
+    # Fetch latest charge for no-subscription customers (sequential, capped at 1 charge each)
+    prog_text.info(f"🔍 Step 2/3 — Checking latest payments for {len(no_sub_customer_ids)} unsubscribed customers...")
+    latest_charge_map = {}  # customer_id -> {"amount": float, "status": str, "date": str}
+    for c in all_customers:
+        cid = c["id"]
+        if cid not in no_sub_customer_ids:
+            continue
+        ak = c.get("_api_key", "")
+        if not ak:
+            continue
+        try:
+            rc = requests.get("https://api.stripe.com/v1/charges",
+                params={"customer": cid, "limit": 1},
+                headers={"Authorization": f"Bearer {ak}"},
+                timeout=8)
+            if rc.ok:
+                charges = rc.json().get("data", [])
+                if charges:
+                    ch = charges[0]
+                    latest_charge_map[cid] = {
+                        "amount": (ch.get("amount") or 0) / 100,
+                        "status": ch.get("status", ""),
+                        "date": datetime.fromtimestamp(ch.get("created", 0), tz=timezone.utc).strftime("%b %d, %Y") if ch.get("created") else ""
+                    }
+        except Exception:
+            pass
+
     # ── Step 3: Match & build results ───────────────────────────────────────
     prog_text.info(f"🔗 Step 3/3 — Matching {len(sf_records)} accounts...")
-    pbar3 = prog_bar.progress(0)
+    pbar = prog_bar.progress(0)
     rows = []
     for i, r in enumerate(sf_records):
         sf_id   = r.get("Id", "")
@@ -369,6 +354,7 @@ if "results" not in st.session_state:
                 "Log Retention (days)": p.get("Logging_Retention_Days__c", "") or ""
             })
 
+        # Match
         cust, via = None, "—"
         sf_id_l = sf_id.lower() if sf_id else ""
         if sf_id_l and sf_id_l in sf_id_idx:
@@ -380,9 +366,13 @@ if "results" not in st.session_state:
         elif dom and dom in domain_idx:
             cust, via = domain_idx[dom], "Email Domain"
 
-        subs = (cust.get("_subs") or []) if cust else []
-        cid = (cust or {}).get("id", "")
+        # Subscriptions — embedded in customer response (up to 10, covers 99% of cases)
+        subs = []
+        if cust:
+            sub_data = cust.get("subscriptions") or {}
+            subs = sub_data.get("data") or []
 
+        # Determine status
         ss, detail = ("no_subscription" if cust else "not_found"), None
         for s in subs:
             if s.get("status") == "active" and s.get("cancel_at_period_end"):
@@ -404,14 +394,14 @@ if "results" not in st.session_state:
                     ts = s.get("canceled_at")
                     detail = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%b %d, %Y") if ts else "?"
                     ss = "canceled"; break
-        # Succeeded = zero subscriptions of ANY kind AND latest charge succeeded
-        # (fetch used status=all so empty list = truly no subscriptions ever)
-        if ss == "no_subscription" and cid and cid in charge_map:
-            ch = charge_map[cid]
-            if ch.get("status") == "succeeded":
+        # If no subscriptions but latest charge succeeded → mark as succeeded
+        if ss == "no_subscription" and cust:
+            charge_info = latest_charge_map.get((cust or {}).get("id",""), {})
+            if charge_info.get("status") == "succeeded":
                 ss = "succeeded"
-                detail = "${:,.2f} on {}".format(ch.get("amount", 0), ch.get("date", ""))
+                detail = '${:,.2f} on {}'.format(charge_info.get('amount', 0), charge_info.get('date', ''))
 
+        # MRR
         mrr = 0.0
         for s in subs:
             if s.get("status") not in ["active", "past_due", "unpaid"]:
@@ -433,6 +423,7 @@ if "results" not in st.session_state:
                 mrr += mo
         mrr = round(mrr, 2)
 
+        # Stripe plans for display
         stripe_plans = []
         for s in subs:
             st_s = s.get("status", "")
@@ -456,11 +447,12 @@ if "results" not in st.session_state:
         sl_map = {
             "active": "Active", "past_due": "Past due", "unpaid": "Unpaid",
             "cancels_on": f"Cancels {detail}",
-            "canceled": "Canceled ({})".format(detail) if detail else "Canceled",
+            "canceled": f"Canceled ({detail})" if detail else "Canceled",
             "not_found": "Not found", "no_subscription": "No subscription",
-            "succeeded": "Succeeded ({})".format(detail) if detail else "Succeeded"
+            "succeeded": f"Succeeded ({detail})" if detail else "Succeeded"
         }
         sl = sl_map.get(ss, ss)
+        cid = (cust or {}).get("id", "")
         src = (cust or {}).get("_src", "—") if cust else "—"
         stripe_arr = round(mrr * 12, 2)
         rows.append({
@@ -474,8 +466,7 @@ if "results" not in st.session_state:
             "sf_url": f"{SF_BASE_URL}/lightning/r/Account/{sf_id}/view" if sf_id else "",
             "stripe_url": f"https://dashboard.stripe.com/customers/{cid}" if cid else ""
         })
-        pbar3.progress((i + 1) / len(sf_records))
-        prog_text.info(f"🔗 Step 3/3 — Matching accounts... ({i+1}/{len(sf_records)})")
+        pbar.progress((i + 1) / len(sf_records))
 
     prog_text.empty()
     prog_bar.empty()
@@ -485,13 +476,11 @@ if "results" not in st.session_state:
     save_cache(rows)
     st.rerun()
 
-
-
-# ── Guard: stop here if results not yet loaded ────────────────────────────────
+# ── Render (only runs when results exist — never during loading) ──────────────
+# Guard: stop here if results not yet loaded (prevents stale UI during loading)
 if "results" not in st.session_state:
     st.stop()
 
-# ── Render ────────────────────────────────────────────────────────────────────
 df = pd.DataFrame(st.session_state["results"])
 if search:
     df = df[df["Account Name"].str.contains(search, case=False, na=False)]
@@ -509,14 +498,10 @@ if "filter" not in st.session_state:
 # Stat boxes
 st.markdown("<br>", unsafe_allow_html=True)
 cols = st.columns(6)
-boxes = [
-    ("Active",         n_active,    "num-active",   "active"),
-    ("Past Due",       n_pastdue,   "num-pastdue",  "past_due"),
-    ("Unpaid",         n_unpaid,    "num-unpaid",   "unpaid"),
-    ("Cancels w/ Date",n_cancels,   "num-cancels",  "cancels_on"),
-    ("Canceled",       n_canceled,  "num-canceled", "canceled"),
-    ("Succeeded",      n_succeeded, "num-active",   "succeeded"),
-]
+boxes = [("Active",n_active,"num-active","active"),("Past Due",n_pastdue,"num-pastdue","past_due"),
+         ("Unpaid",n_unpaid,"num-unpaid","unpaid"),("Cancels w/ Date",n_cancels,"num-cancels","cancels_on"),
+         ("Canceled",n_canceled,"num-canceled","canceled"),
+         ("Succeeded",n_succeeded,"num-active","succeeded")]
 for col,(label,num,css,key) in zip(cols,boxes):
     with col:
         sel = st.session_state["filter"]==key
@@ -541,8 +526,7 @@ if "selected_account" in st.session_state:
     st.divider()
     sc = {"active":("#dcfce7","#166534"),"past_due":("#fef3c7","#92400e"),
           "unpaid":("#fef3c7","#92400e"),"cancels_on":("#ede9fe","#5b21b6"),
-          "canceled":("#fee2e2","#991b1b"),"succeeded":("#dcfce7","#166534")}.get(
-          a["Stripe Status"],("#f3f4f6","#374151"))
+          "canceled":("#fee2e2","#991b1b")}.get(a["Stripe Status"],("#f3f4f6","#374151"))
     c1,c2 = st.columns([3,1])
     with c1:
         st.markdown(f"## {a['Account Name']}")
@@ -557,9 +541,9 @@ if "selected_account" in st.session_state:
                     unsafe_allow_html=True)
     st.divider()
     m1,m2,m3 = st.columns(3)
-    m1.metric("Salesforce All-Time ARR", f"${a['SF ARR']:,.2f}")
-    m2.metric("Stripe MRR",              f"${a['Stripe MRR']:,.2f}")
-    m3.metric("Stripe ARR (MRR×12)",     f"${a['Stripe ARR']:,.2f}")
+    m1.metric("Salesforce All-Time ARR",f"${a['SF ARR']:,.2f}")
+    m2.metric("Stripe MRR",f"${a['Stripe MRR']:,.2f}")
+    m3.metric("Stripe ARR (MRR×12)",f"${a['Stripe ARR']:,.2f}")
     st.divider()
     t1,t2 = st.tabs(["☁️ Salesforce Plans","💳 Stripe Subscriptions"])
     with t1:
@@ -584,6 +568,7 @@ else:
                  "cancels_on":"Cancels w/ Date","canceled":"Canceled","succeeded":"Succeeded"}
     title = f"{label_map.get(flt,flt)} Accounts" if flt else "Account List View"
 
+    # Filters
     with st.expander("🔽 Filters", expanded=False):
         cl1,cl2 = st.columns([5,1])
         with cl2:
@@ -626,14 +611,15 @@ else:
                 index=amf_opts.index(amf_val) if amf_val in amf_opts else 0, key="arr_match_filter")
 
         smap = {"Active":"active","Past due":"past_due","Unpaid":"unpaid",
-                "Cancels w/ Date":"cancels_on","Canceled":"canceled","Succeeded":"succeeded",
+                "Cancels w/ Date":"cancels_on","Canceled":"canceled",
+                "Succeeded":"succeeded",
                 "Not found":"not_found","No subscription":"no_subscription"}
         if sel_country != "All": display = display[display["Country"]==sel_country]
         if sel_acct    != "All": display = display[display["Stripe Acct"]==sel_acct]
         if sel_status  != "All": display = display[display["Stripe Status"]==smap.get(sel_status,sel_status)]
-        if min_sf    > 0: display = display[display["SF ARR"]>=min_sf]
-        if min_stripe> 0: display = display[display["Stripe ARR"]>=min_stripe]
-        if arr_match_filter=="✅ Match":     display = display[display["ARR Match"]==True]
+        if min_sf   > 0: display = display[display["SF ARR"]>=min_sf]
+        if min_stripe>0: display = display[display["Stripe ARR"]>=min_stripe]
+        if arr_match_filter=="✅ Match":    display = display[display["ARR Match"]==True]
         elif arr_match_filter=="❌ No match": display = display[display["ARR Match"]==False]
 
     st.markdown(f"### {title} ({len(display)})")
@@ -653,13 +639,13 @@ else:
             if st.button(row["Account Name"], key=f"a_{row['sf_id']}", use_container_width=True):
                 st.session_state["selected_account"] = row.to_dict()
                 st.session_state["saved_filter_state"] = {
-                    "filter":           st.session_state.get("filter"),
-                    "sel_country":      st.session_state.get("sel_country","All"),
-                    "sel_acct":         st.session_state.get("sel_acct","All"),
-                    "sel_status":       st.session_state.get("sel_status","All"),
-                    "min_sf":           st.session_state.get("min_sf",0),
-                    "min_stripe":       st.session_state.get("min_stripe",0),
-                    "arr_match_filter": st.session_state.get("arr_match_filter","All"),
+                    "filter":st.session_state.get("filter"),
+                    "sel_country":st.session_state.get("sel_country","All"),
+                    "sel_acct":st.session_state.get("sel_acct","All"),
+                    "sel_status":st.session_state.get("sel_status","All"),
+                    "min_sf":st.session_state.get("min_sf",0),
+                    "min_stripe":st.session_state.get("min_stripe",0),
+                    "arr_match_filter":st.session_state.get("arr_match_filter","All"),
                 }
                 st.rerun()
         c[1].markdown(f'<div style="padding-top:6px;white-space:nowrap;font-size:14px">{row["Country"] or "—"}</div>', unsafe_allow_html=True)
