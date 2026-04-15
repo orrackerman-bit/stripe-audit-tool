@@ -60,16 +60,6 @@ def is_on_demand(text):
     t = (text or "").lower()
     return "on-demand" in t or "on demand" in t or "ondemand" in t
 
-def get_product_name(item):
-    price = item.get("price") or {}
-    prod  = price.get("product")
-    if isinstance(prod, dict):
-        n = prod.get("name","") or prod.get("description","") or ""
-        if n: return n
-    nick = price.get("nickname","") or ""
-    if nick: return nick
-    return price.get("id","")
-
 def get_auth_url():
     return f"{AUTH_URL}?{urlencode({'response_type':'code','client_id':SFDC_CLIENT_ID,'redirect_uri':REDIRECT_URI,'scope':'api refresh_token offline_access'})}"
 
@@ -198,14 +188,13 @@ if "results" not in st.session_state:
         st.error(f"Salesforce error: {e}")
         st.stop()
 
-    # ── Step 2: Stripe — bulk fetch WITH subscriptions inline ────────────────
-    # This is the reliable approach: subscriptions embedded in customer response
-    prog_text.info(f"💳 Step 2/3 — Fetching Stripe customers with subscriptions...")
+    # ── Step 2: Stripe — fetch US + Intl in parallel ─────────────────────────
+    prog_text.info("💳 Step 2/3 — Fetching Stripe customers (US + Intl in parallel)...")
     all_customers = []
-    try:
-        for api_key, src in [(STRIPE_US_KEY, "US"), (STRIPE_INTL_KEY, "Intl")]:
-            if not api_key or len(api_key) < 10:
-                continue
+
+    def fetch_stripe_customers(api_key, src, prog_ref):
+        customers = []
+        try:
             last_id = None
             count = 0
             while True:
@@ -215,7 +204,7 @@ if "results" not in st.session_state:
                 r2 = requests.get("https://api.stripe.com/v1/customers",
                     params=p2,
                     headers={"Authorization": f"Bearer {api_key}"},
-                    timeout=20)
+                    timeout=30)
                 if not r2.ok:
                     break
                 d2 = r2.json()
@@ -225,17 +214,35 @@ if "results" not in st.session_state:
                 for c in batch:
                     c["_src"] = src
                     c["_api_key"] = api_key
-                all_customers.extend(batch)
+                customers.extend(batch)
                 count += len(batch)
-                prog_text.info(f"💳 Step 2/3 — {src}: {count} customers fetched...")
                 if not d2.get("has_more"):
                     break
                 last_id = batch[-1]["id"]
+        except Exception:
+            pass
+        return customers
+
+    try:
+        # ── Fetch US and Intl in parallel ────────────────────────────────────
+        keys_and_srcs = [
+            (k, s) for k, s in [(STRIPE_US_KEY, "US"), (STRIPE_INTL_KEY, "Intl")]
+            if k and len(k) >= 10
+        ]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            futures = {ex.submit(fetch_stripe_customers, k, s, None): s for k, s in keys_and_srcs}
+            for fut in concurrent.futures.as_completed(futures):
+                src = futures[fut]
+                batch = fut.result()
+                all_customers.extend(batch)
+                prog_text.info(f"💳 Step 2/3 — {src}: {len(batch)} customers fetched...")
     except Exception as e:
         st.error(f"Stripe fetch error: {e}")
         st.stop()
 
-    # Build indexes
+    prog_text.info(f"💳 Step 2/3 — Total: {len(all_customers)} Stripe customers loaded.")
+
+    # ── Build lookup indexes ─────────────────────────────────────────────────
     sf_id_idx, parent_idx, domain_idx = {}, {}, {}
     for c in all_customers:
         meta = c.get("metadata") or {}
@@ -253,9 +260,8 @@ if "results" not in st.session_state:
         if dom2 and dom2 not in domain_idx:
             domain_idx[dom2] = c
 
-    # Collect all unique product IDs from subscription items & fetch their names
-    # (typically only 20-50 unique products — very fast one-time fetch)
-    prod_id_to_key = {}  # product_id -> api_key
+    # ── Collect unique product IDs across ALL subscriptions ──────────────────
+    prod_id_to_key = {}
     for c in all_customers:
         ak = c.get("_api_key", "")
         for s in (c.get("subscriptions") or {}).get("data") or []:
@@ -265,19 +271,28 @@ if "results" not in st.session_state:
                 if isinstance(prod, str) and prod and prod not in prod_id_to_key:
                     prod_id_to_key[prod] = ak
 
-    prog_text.info(f"🏷️ Step 2/3 — Fetching {len(prod_id_to_key)} product names...")
+    # ── Fetch ALL product names in parallel (20 workers) ─────────────────────
+    prog_text.info(f"🏷️ Step 2/3 — Fetching {len(prod_id_to_key)} product names in parallel...")
     product_name_map = {}
-    for prod_id, ak in prod_id_to_key.items():
+
+    def _fetch_one_product(args):
+        prod_id, ak = args
         if not ak:
-            continue
+            return prod_id, ""
         try:
             rp = requests.get(f"https://api.stripe.com/v1/products/{prod_id}",
-                headers={"Authorization": f"Bearer {ak}"}, timeout=8)
+                headers={"Authorization": f"Bearer {ak}"}, timeout=10)
             if rp.ok:
-                product_name_map[prod_id] = rp.json().get("name", "") or ""
+                return prod_id, rp.json().get("name", "") or ""
         except Exception:
-            product_name_map[prod_id] = ""
+            pass
+        return prod_id, ""
 
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        for prod_id, name in executor.map(_fetch_one_product, prod_id_to_key.items()):
+            product_name_map[prod_id] = name
+
+    # ── Product name resolver ─────────────────────────────────────────────────
     def resolve_product_name(item):
         price = item.get("price") or {}
         prod = price.get("product")
@@ -294,10 +309,25 @@ if "results" not in st.session_state:
             return nick
         return price.get("id", "")
 
-    # ── Step 3: Match & build results ───────────────────────────────────────
+    # ── FIX: only consider subscriptions with at least one real (non-on-demand) item ──
+    def sub_has_real_items(s):
+        """Returns True if subscription has ≥1 item that is NOT on-demand."""
+        items = (s.get("items") or {}).get("data") or []
+        return any(not is_on_demand(resolve_product_name(item)) for item in items)
+
+    def sub_is_yearly(s):
+        """Returns True if ANY item in the subscription has a yearly billing interval."""
+        items = (s.get("items") or {}).get("data") or []
+        return any(
+            (item.get("price") or {}).get("recurring", {}).get("interval") == "year"
+            for item in items
+        )
+
+    # ── Step 3: Match & build results ────────────────────────────────────────
     prog_text.info(f"🔗 Step 3/3 — Matching {len(sf_records)} accounts...")
     pbar = prog_bar.progress(0)
     rows = []
+
     for i, r in enumerate(sf_records):
         sf_id   = r.get("Id", "")
         name    = r.get("Name", "")
@@ -319,7 +349,7 @@ if "results" not in st.session_state:
                 "Log Retention (days)": p.get("Logging_Retention_Days__c", "") or ""
             })
 
-        # Match
+        # ── Match Stripe customer ─────────────────────────────────────────────
         cust, via = None, "—"
         sf_id_l = sf_id.lower() if sf_id else ""
         if sf_id_l and sf_id_l in sf_id_idx:
@@ -331,38 +361,62 @@ if "results" not in st.session_state:
         elif dom and dom in domain_idx:
             cust, via = domain_idx[dom], "Email Domain"
 
-        # Subscriptions — embedded in customer response (up to 10, covers 99% of cases)
+        # ── All subscriptions from embedded response ──────────────────────────
         subs = []
         if cust:
             sub_data = cust.get("subscriptions") or {}
             subs = sub_data.get("data") or []
 
-        # Determine status
+        # ── KEY FIX: only use subscriptions that have real (non-on-demand) items ──
+        # This prevents an active on-demand sub from masking a canceled real sub.
+        real_subs = [s for s in subs if sub_has_real_items(s)]
+
+        # ── Determine status (using real_subs only) ───────────────────────────
         ss, detail = ("no_subscription" if cust else "not_found"), None
-        for s in subs:
+
+        # 1) cancels_on — active + cancel_at_period_end, but NOT for yearly billing
+        #    (yearly contracts naturally end; cancel_at_period_end just means non-renewal
+        #    of an annual term, which should stay "active" until it actually expires)
+        for s in real_subs:
             if s.get("status") == "active" and s.get("cancel_at_period_end"):
-                ts = s.get("cancel_at")
-                detail = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%b %d") if ts else "?"
-                ss = "cancels_on"; break
+                if sub_is_yearly(s):
+                    # Yearly contract set to not renew → still show as active
+                    ss = "active"
+                else:
+                    ts = s.get("cancel_at")
+                    detail = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%b %d") if ts else "?"
+                    ss = "cancels_on"
+                break
+
+        # 2) active (no cancel flag, or yearly that won't renew)
         if ss in ("not_found", "no_subscription"):
-            for s in subs:
-                if s.get("status") == "active":   ss = "active";   break
+            for s in real_subs:
+                if s.get("status") == "active":
+                    ss = "active"; break
+
+        # 3) past_due
         if ss in ("not_found", "no_subscription"):
-            for s in subs:
-                if s.get("status") == "past_due": ss = "past_due"; break
+            for s in real_subs:
+                if s.get("status") == "past_due":
+                    ss = "past_due"; break
+
+        # 4) unpaid
         if ss in ("not_found", "no_subscription"):
-            for s in subs:
-                if s.get("status") == "unpaid":   ss = "unpaid";   break
+            for s in real_subs:
+                if s.get("status") == "unpaid":
+                    ss = "unpaid"; break
+
+        # 5) canceled — only reached if ALL real subs are canceled (no active on-demand can save it)
         if ss in ("not_found", "no_subscription"):
-            for s in subs:
+            for s in real_subs:
                 if s.get("status") == "canceled":
                     ts = s.get("canceled_at")
                     detail = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%b %d, %Y") if ts else "?"
                     ss = "canceled"; break
 
-        # MRR
+        # ── MRR / ARR calculation (real items only, on-demand excluded) ───────
         mrr = 0.0
-        for s in subs:
+        for s in real_subs:
             if s.get("status") not in ["active", "past_due", "unpaid"]:
                 continue
             for item in (s.get("items") or {}).get("data") or []:
@@ -372,57 +426,76 @@ if "results" not in st.session_state:
                 price = item.get("price") or {}
                 amt = (price.get("unit_amount") or 0) / 100
                 qty = item.get("quantity") or 1
-                iv = (price.get("recurring") or {}).get("interval", "month")
-                ic = (price.get("recurring") or {}).get("interval_count", 1) or 1
-                mo = amt * qty
-                if iv == "year":   mo /= (12 * ic)
-                elif iv == "week": mo = mo * 4.33 / ic
-                elif iv == "day":  mo = mo * 30 / ic
-                else:              mo /= ic
+                iv  = (price.get("recurring") or {}).get("interval", "month")
+                ic  = (price.get("recurring") or {}).get("interval_count", 1) or 1
+                mo  = amt * qty
+                if   iv == "year":  mo /= (12 * ic)   # normalize annual → monthly
+                elif iv == "week":  mo = mo * 4.33 / ic
+                elif iv == "day":   mo = mo * 30 / ic
+                else:               mo /= ic
                 mrr += mo
         mrr = round(mrr, 2)
 
-        # Stripe plans for display
+        # ── Stripe plans for the detail view (real items only) ────────────────
         stripe_plans = []
-        for s in subs:
+        for s in real_subs:
             st_s = s.get("status", "")
-            ca = s.get("cancel_at")
-            cd = datetime.fromtimestamp(ca, tz=timezone.utc).strftime("%b %d, %Y") if ca else None
-            ds = f"Cancels {cd}" if (st_s == "active" and cd) else st_s.replace("_", " ").title()
+            ca   = s.get("cancel_at")
+            # Only show "Cancels <date>" for monthly subscriptions
+            if st_s == "active" and ca and not sub_is_yearly(s):
+                cd  = datetime.fromtimestamp(ca, tz=timezone.utc).strftime("%b %d, %Y")
+                ds  = f"Cancels {cd}"
+            else:
+                ds  = st_s.replace("_", " ").title()
+
             for item in (s.get("items") or {}).get("data") or []:
                 pname = resolve_product_name(item)
                 if is_on_demand(pname):
                     continue
                 price = item.get("price") or {}
-                amt = (price.get("unit_amount") or 0) / 100
-                qty = item.get("quantity") or 1
-                iv = (price.get("recurring") or {}).get("interval", "month")
+                amt   = (price.get("unit_amount") or 0) / 100
+                qty   = item.get("quantity") or 1
+                iv    = (price.get("recurring") or {}).get("interval", "month")
                 stripe_plans.append({
-                    "Product": pname, "Price": f"${amt:,.2f}", "Qty": qty,
+                    "Product":  pname,
+                    "Price":    f"${amt:,.2f}",
+                    "Qty":      qty,
                     "Total/mo": f"${round(amt * qty, 2):,.2f}",
-                    "Frequency": iv.capitalize(), "Status": ds
+                    "Frequency": iv.capitalize(),
+                    "Status":   ds
                 })
 
         sl_map = {
-            "active": "Active", "past_due": "Past due", "unpaid": "Unpaid",
-            "cancels_on": f"Cancels {detail}",
-            "canceled": f"Canceled ({detail})" if detail else "Canceled",
-            "not_found": "Not found", "no_subscription": "No subscription"
+            "active":         "Active",
+            "past_due":       "Past due",
+            "unpaid":         "Unpaid",
+            "cancels_on":     f"Cancels {detail}",
+            "canceled":       f"Canceled ({detail})" if detail else "Canceled",
+            "not_found":      "Not found",
+            "no_subscription":"No subscription"
         }
-        sl = sl_map.get(ss, ss)
-        cid = (cust or {}).get("id", "")
-        src = (cust or {}).get("_src", "—") if cust else "—"
+        sl        = sl_map.get(ss, ss)
+        cid       = (cust or {}).get("id", "")
+        src       = (cust or {}).get("_src", "—") if cust else "—"
         stripe_arr = round(mrr * 12, 2)
+
         rows.append({
-            "sf_id": sf_id, "Account Name": name, "Country": country,
-            "Billing Email": email, "SF ARR": arr, "Stripe MRR": mrr,
-            "Stripe ARR": stripe_arr,
-            "ARR Match": abs((arr or 0) - stripe_arr) < 1.0,
-            "Stripe Status": ss, "Status Label": sl,
-            "Found Via": via, "Stripe Acct": src,
-            "sf_plans": plans, "stripe_plans": stripe_plans,
-            "sf_url": f"{SF_BASE_URL}/lightning/r/Account/{sf_id}/view" if sf_id else "",
-            "stripe_url": f"https://dashboard.stripe.com/customers/{cid}" if cid else ""
+            "sf_id":        sf_id,
+            "Account Name": name,
+            "Country":      country,
+            "Billing Email":email,
+            "SF ARR":       arr,
+            "Stripe MRR":   mrr,
+            "Stripe ARR":   stripe_arr,
+            "ARR Match":    abs((arr or 0) - stripe_arr) < 1.0,
+            "Stripe Status":ss,
+            "Status Label": sl,
+            "Found Via":    via,
+            "Stripe Acct":  src,
+            "sf_plans":     plans,
+            "stripe_plans": stripe_plans,
+            "sf_url":       f"{SF_BASE_URL}/lightning/r/Account/{sf_id}/view" if sf_id else "",
+            "stripe_url":   f"https://dashboard.stripe.com/customers/{cid}" if cid else ""
         })
         pbar.progress((i + 1) / len(sf_records))
 
@@ -434,8 +507,7 @@ if "results" not in st.session_state:
     save_cache(rows)
     st.rerun()
 
-# ── Render (only runs when results exist — never during loading) ──────────────
-# Guard: stop here if results not yet loaded (prevents stale UI during loading)
+# ── Render (only runs when results exist) ────────────────────────────────────
 if "results" not in st.session_state:
     st.stop()
 
@@ -452,15 +524,19 @@ n_canceled = len(df[df["Stripe Status"]=="canceled"])
 if "filter" not in st.session_state:
     st.session_state["filter"] = None
 
-# Stat boxes
+# ── Stat boxes ───────────────────────────────────────────────────────────────
 st.markdown("<br>", unsafe_allow_html=True)
 cols = st.columns(5)
-boxes = [("Active",n_active,"num-active","active"),("Past Due",n_pastdue,"num-pastdue","past_due"),
-         ("Unpaid",n_unpaid,"num-unpaid","unpaid"),("Cancels w/ Date",n_cancels,"num-cancels","cancels_on"),
-         ("Canceled",n_canceled,"num-canceled","canceled")]
-for col,(label,num,css,key) in zip(cols,boxes):
+boxes = [
+    ("Active",          n_active,   "num-active",   "active"),
+    ("Past Due",        n_pastdue,  "num-pastdue",  "past_due"),
+    ("Unpaid",          n_unpaid,   "num-unpaid",   "unpaid"),
+    ("Cancels w/ Date", n_cancels,  "num-cancels",  "cancels_on"),
+    ("Canceled",        n_canceled, "num-canceled", "canceled"),
+]
+for col, (label, num, css, key) in zip(cols, boxes):
     with col:
-        sel = st.session_state["filter"]==key
+        sel = st.session_state["filter"] == key
         st.markdown(f"""<div style="background:{'#f5f3ff' if sel else '#fff'};
             border:{'2px solid #6366f1' if sel else '1px solid #e5e7eb'};
             border-radius:12px;padding:1.25rem 1.5rem;text-align:center;margin-bottom:.5rem">
@@ -468,22 +544,25 @@ for col,(label,num,css,key) in zip(cols,boxes):
             <div class="stat-label">{label}</div></div>""", unsafe_allow_html=True)
         if st.button(f"{'✓ ' if sel else ''}{label}", key=f"b_{key}", use_container_width=True):
             st.session_state["filter"] = None if sel else key
-            st.session_state.pop("selected_account",None)
+            st.session_state.pop("selected_account", None)
             st.rerun()
 
-# Account detail
+# ── Account detail view ──────────────────────────────────────────────────────
 if "selected_account" in st.session_state:
     a = st.session_state["selected_account"]
     if st.button("← Back"):
         del st.session_state["selected_account"]
-        for k,v in st.session_state.pop("saved_filter_state",{}).items():
+        for k, v in st.session_state.pop("saved_filter_state", {}).items():
             st.session_state[k] = v
         st.rerun()
     st.divider()
-    sc = {"active":("#dcfce7","#166534"),"past_due":("#fef3c7","#92400e"),
-          "unpaid":("#fef3c7","#92400e"),"cancels_on":("#ede9fe","#5b21b6"),
-          "canceled":("#fee2e2","#991b1b")}.get(a["Stripe Status"],("#f3f4f6","#374151"))
-    c1,c2 = st.columns([3,1])
+    sc = {"active":        ("#dcfce7","#166534"),
+          "past_due":      ("#fef3c7","#92400e"),
+          "unpaid":        ("#fef3c7","#92400e"),
+          "cancels_on":    ("#ede9fe","#5b21b6"),
+          "canceled":      ("#fee2e2","#991b1b")
+         }.get(a["Stripe Status"], ("#f3f4f6","#374151"))
+    c1, c2 = st.columns([3, 1])
     with c1:
         st.markdown(f"## {a['Account Name']}")
         links = []
@@ -496,14 +575,14 @@ if "selected_account" in st.session_state:
                     f"border-radius:20px;font-size:13px;font-weight:600'>{a['Status Label']}</span>",
                     unsafe_allow_html=True)
     st.divider()
-    m1,m2,m3 = st.columns(3)
-    m1.metric("Salesforce All-Time ARR",f"${a['SF ARR']:,.2f}")
-    m2.metric("Stripe MRR",f"${a['Stripe MRR']:,.2f}")
-    m3.metric("Stripe ARR (MRR×12)",f"${a['Stripe ARR']:,.2f}")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Salesforce All-Time ARR", f"${a['SF ARR']:,.2f}")
+    m2.metric("Stripe MRR",              f"${a['Stripe MRR']:,.2f}")
+    m3.metric("Stripe ARR (MRR×12)",     f"${a['Stripe ARR']:,.2f}")
     st.divider()
-    t1,t2 = st.tabs(["☁️ Salesforce Plans","💳 Stripe Subscriptions"])
+    t1, t2 = st.tabs(["☁️ Salesforce Plans", "💳 Stripe Subscriptions"])
     with t1:
-        pl = a.get("sf_plans",[])
+        pl = a.get("sf_plans", [])
         if pl:
             pdf = pd.DataFrame(pl)
             pdf["ARR"] = pdf["ARR"].apply(lambda x: f"${x:,.2f}" if x else "—")
@@ -511,22 +590,23 @@ if "selected_account" in st.session_state:
         else:
             st.info("No active plans in Salesforce.")
     with t2:
-        sp = a.get("stripe_plans",[])
+        sp = a.get("stripe_plans", [])
         if sp:
             st.dataframe(pd.DataFrame(sp), use_container_width=True, hide_index=True)
         else:
             st.info("No subscriptions in Stripe.")
 
+# ── Account list view ────────────────────────────────────────────────────────
 else:
     flt = st.session_state.get("filter")
-    display = df[df["Stripe Status"]==flt].copy() if flt else df.copy()
+    display = df[df["Stripe Status"] == flt].copy() if flt else df.copy()
     label_map = {"active":"Active","past_due":"Past Due","unpaid":"Unpaid",
                  "cancels_on":"Cancels w/ Date","canceled":"Canceled"}
-    title = f"{label_map.get(flt,flt)} Accounts" if flt else "Account List View"
+    title = f"{label_map.get(flt, flt)} Accounts" if flt else "Account List View"
 
-    # Filters
+    # ── Filters ───────────────────────────────────────────────────────────────
     with st.expander("🔽 Filters", expanded=False):
-        cl1,cl2 = st.columns([5,1])
+        cl1, cl2 = st.columns([5, 1])
         with cl2:
             if st.button("✕ Clear all", use_container_width=True):
                 st.session_state["filter"]           = None
@@ -537,23 +617,26 @@ else:
                 st.session_state["min_stripe"]       = 0
                 st.session_state["arr_match_filter"] = "All"
                 st.rerun()
-        fc1,fc2,fc3 = st.columns(3)
+        fc1, fc2, fc3 = st.columns(3)
         with fc1:
             countries = ["All"] + sorted(df["Country"].dropna().unique().tolist())
             sc_val = st.session_state.get("sel_country","All")
             sel_country = st.selectbox("Country", countries,
-                index=countries.index(sc_val) if sc_val in countries else 0, key="sel_country")
+                index=countries.index(sc_val) if sc_val in countries else 0,
+                key="sel_country")
         with fc2:
             accts = ["All","US","Intl"]
             sa_val = st.session_state.get("sel_acct","All")
             sel_acct = st.selectbox("Stripe Account", accts,
-                index=accts.index(sa_val) if sa_val in accts else 0, key="sel_acct")
+                index=accts.index(sa_val) if sa_val in accts else 0,
+                key="sel_acct")
         with fc3:
             statuses = ["All","Active","Past due","Unpaid","Cancels w/ Date","Canceled","Not found","No subscription"]
             ss_val = st.session_state.get("sel_status","All")
             sel_status = st.selectbox("Stripe Status", statuses,
-                index=statuses.index(ss_val) if ss_val in statuses else 0, key="sel_status")
-        fc4,fc5,fc6 = st.columns(3)
+                index=statuses.index(ss_val) if ss_val in statuses else 0,
+                key="sel_status")
+        fc4, fc5, fc6 = st.columns(3)
         with fc4:
             min_sf = st.number_input("Min SF ARR ($)", min_value=0,
                 value=int(st.session_state.get("min_sf",0)), step=100, key="min_sf")
@@ -564,42 +647,43 @@ else:
             amf_opts = ["All","✅ Match","❌ No match"]
             amf_val = st.session_state.get("arr_match_filter","All")
             arr_match_filter = st.selectbox("ARR Match", amf_opts,
-                index=amf_opts.index(amf_val) if amf_val in amf_opts else 0, key="arr_match_filter")
+                index=amf_opts.index(amf_val) if amf_val in amf_opts else 0,
+                key="arr_match_filter")
 
         smap = {"Active":"active","Past due":"past_due","Unpaid":"unpaid",
                 "Cancels w/ Date":"cancels_on","Canceled":"canceled",
                 "Not found":"not_found","No subscription":"no_subscription"}
-        if sel_country != "All": display = display[display["Country"]==sel_country]
-        if sel_acct    != "All": display = display[display["Stripe Acct"]==sel_acct]
-        if sel_status  != "All": display = display[display["Stripe Status"]==smap.get(sel_status,sel_status)]
-        if min_sf   > 0: display = display[display["SF ARR"]>=min_sf]
-        if min_stripe>0: display = display[display["Stripe ARR"]>=min_stripe]
-        if arr_match_filter=="✅ Match":    display = display[display["ARR Match"]==True]
-        elif arr_match_filter=="❌ No match": display = display[display["ARR Match"]==False]
+        if sel_country      != "All": display = display[display["Country"]     == sel_country]
+        if sel_acct         != "All": display = display[display["Stripe Acct"] == sel_acct]
+        if sel_status       != "All": display = display[display["Stripe Status"] == smap.get(sel_status, sel_status)]
+        if min_sf           > 0:      display = display[display["SF ARR"]      >= min_sf]
+        if min_stripe       > 0:      display = display[display["Stripe ARR"]  >= min_stripe]
+        if arr_match_filter == "✅ Match":    display = display[display["ARR Match"] == True]
+        elif arr_match_filter == "❌ No match": display = display[display["ARR Match"] == False]
 
     st.markdown(f"### {title} ({len(display)})")
 
     icons = {"active":"✅","past_due":"⚠️","unpaid":"🔶","cancels_on":"🟣",
              "canceled":"🔴","not_found":"⬜","no_subscription":"⬜"}
 
-    h = st.columns([2.5,1,2,1.2,1.2,1.8,0.7,0.8])
-    for col,hdr in zip(h,["**Account Name**","**Country**","**Billing Email**",
-                            "**SF ARR**","**Stripe ARR**","**Stripe Status**","**Acct**","**ARR ✓**"]):
+    h = st.columns([2.5, 1, 2, 1.2, 1.2, 1.8, 0.7, 0.8])
+    for col, hdr in zip(h, ["**Account Name**","**Country**","**Billing Email**",
+                              "**SF ARR**","**Stripe ARR**","**Stripe Status**","**Acct**","**ARR ✓**"]):
         col.markdown(hdr)
     st.markdown('<hr style="margin:4px 0 0;border:none;border-top:1.5px solid #e5e7eb">', unsafe_allow_html=True)
 
-    for _,row in display.iterrows():
-        c = st.columns([2.5,1,2,1.2,1.2,1.8,0.7,0.8])
+    for _, row in display.iterrows():
+        c = st.columns([2.5, 1, 2, 1.2, 1.2, 1.8, 0.7, 0.8])
         with c[0]:
             if st.button(row["Account Name"], key=f"a_{row['sf_id']}", use_container_width=True):
                 st.session_state["selected_account"] = row.to_dict()
                 st.session_state["saved_filter_state"] = {
-                    "filter":st.session_state.get("filter"),
-                    "sel_country":st.session_state.get("sel_country","All"),
-                    "sel_acct":st.session_state.get("sel_acct","All"),
-                    "sel_status":st.session_state.get("sel_status","All"),
-                    "min_sf":st.session_state.get("min_sf",0),
-                    "min_stripe":st.session_state.get("min_stripe",0),
+                    "filter":          st.session_state.get("filter"),
+                    "sel_country":     st.session_state.get("sel_country","All"),
+                    "sel_acct":        st.session_state.get("sel_acct","All"),
+                    "sel_status":      st.session_state.get("sel_status","All"),
+                    "min_sf":          st.session_state.get("min_sf",0),
+                    "min_stripe":      st.session_state.get("min_stripe",0),
                     "arr_match_filter":st.session_state.get("arr_match_filter","All"),
                 }
                 st.rerun()
@@ -616,4 +700,4 @@ else:
     csv = display.drop(columns=["sf_plans","stripe_plans","sf_id","sf_url","stripe_url"],
                        errors="ignore").to_csv(index=False).encode("utf-8")
     st.download_button("⬇ Download CSV", csv,
-        f"stripe_audit_{datetime.today().strftime('%Y-%m-%d')}.csv","text/csv")
+        f"stripe_audit_{datetime.today().strftime('%Y-%m-%d')}.csv", "text/csv")
