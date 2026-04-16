@@ -154,7 +154,7 @@ if "results" not in st.session_state:
     try:
         soql = (
             "SELECT Id,Name,BillingCountry,Billing_Email_Address__c,"
-            "All_Time_ARR__c,Logz_Io_Parent_Account_Key__c,Email_Domain__c,"
+            "All_Time_ARR__c,Logz_Io_Parent_Account_Key__c,"
             "(SELECT Name,ARR__c,Unit__c,Start_Date__c,End_Date__c,"
             "Logging_Retention_Days__c,Active__c FROM Contract_Assets__r WHERE Active__c=TRUE) "
             "FROM Account WHERE Type='Customer' AND All_Time_ARR__c>0 "
@@ -335,7 +335,8 @@ if "results" not in st.session_state:
         country = r.get("BillingCountry") or ""
         email   = (r.get("Billing_Email_Address__c") or "").lower()
         pkey    = str(r.get("Logz_Io_Parent_Account_Key__c") or "").strip()
-        dom     = str(r.get("Email_Domain__c") or "").strip().lower()
+        # Derive domain from billing email (Email_Domain__c is a org-specific custom field)
+        dom     = email.split("@")[-1].strip() if "@" in email else ""
 
         plans = []
         for p in ((r.get("Contract_Assets__r") or {}).get("records") or []):
